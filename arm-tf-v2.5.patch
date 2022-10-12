@@ -1,0 +1,31 @@
+diff --git a/plat/allwinner/common/include/platform_def.h b/plat/allwinner/common/include/platform_def.h
+index 4893368c2..04f61685c 100644
+--- a/plat/allwinner/common/include/platform_def.h
++++ b/plat/allwinner/common/include/platform_def.h
+@@ -14,7 +14,7 @@
+ #include <sunxi_mmap.h>
+ 
+ /* The SCP firmware is allocated the last 16KiB of SRAM A2. */
+-#define SUNXI_SCP_SIZE			0x4000
++#define SUNXI_SCP_SIZE			0x3000
+ 
+ #ifdef SUNXI_BL31_IN_DRAM
+ 
+diff --git a/plat/allwinner/common/include/sunxi_def.h b/plat/allwinner/common/include/sunxi_def.h
+index f0368167c..39288e4ef 100644
+--- a/plat/allwinner/common/include/sunxi_def.h
++++ b/plat/allwinner/common/include/sunxi_def.h
+@@ -12,7 +12,12 @@
+ 
+ /* UART configuration */
+ #define SUNXI_UART0_BAUDRATE		115200
+-#define SUNXI_UART0_CLK_IN_HZ		SUNXI_OSC24M_CLK_IN_HZ
++/*  we need UART to work at both 115200 and 3M baud. Due to possible values for dividers, 24MHz cannot provide
++    logically close baud rates for both 11.52K and 3M baud. Which is why we configure the same here for
++    50M and accordingly handle the change in other repositories. This could lead to ARM-TF spitting out
++    invalid characters at bootup, but since we know the ARM-TF is already working as expected, we do not do
++    further changes here. In case some ARM-TF debugging is required, change this back to 24MHz*/
++#define SUNXI_UART0_CLK_IN_HZ		50000000//SUNXI_OSC24M_CLK_IN_HZ
+ 
+ #define SUNXI_SOC_A64			0x1689
+ #define SUNXI_SOC_H5			0x1718

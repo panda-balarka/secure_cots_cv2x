@@ -1,0 +1,405 @@
+diff --git a/Makefile b/Makefile
+index b4f1cbcf9b..a85e2c5d2a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1335,6 +1335,7 @@ cmd_binman = $(srctree)/tools/binman/binman $(if $(BINMAN_DEBUG),-D) \
+ 		-I . -I $(srctree) -I $(srctree)/board/$(BOARDDIR) \
+ 		-I arch/$(ARCH)/dts -a of-list=$(CONFIG_OF_LIST) \
+ 		-a atf-bl31-path=${BL31} \
++		-a tee-bl32-path=${TEE} \
+ 		-a default-dt=$(default_dt) \
+ 		-a scp-path=$(SCP) \
+ 		$(BINMAN_$(@F))
+diff --git a/arch/arm/dts/sunxi-u-boot.dtsi b/arch/arm/dts/sunxi-u-boot.dtsi
+index c77cf7cacf..ee928c44f4 100644
+--- a/arch/arm/dts/sunxi-u-boot.dtsi
++++ b/arch/arm/dts/sunxi-u-boot.dtsi
+@@ -72,7 +72,23 @@
+ 						filename = "scp.bin";
+ 						missing-msg = "scp-sunxi";
+ 					};
++				};				
++
++//#ifdef CONFIG_SUNXI_OPTEE_DTB
++				tee {
++					description = "OP-TEE";
++					type = "tee";
++					arch = "arm64";
++					compression = "none";
++					os = "tee";
++					load = <0x40000000>;
++
++					tee-bl32 {
++						filename = "tee-pager_v2.bin";
++						missing-msg = "tee-bl32-sunxi";
++					};
+ 				};
++//#endif				
+ 
+ 				@fdt-SEQ {
+ 					description = "NAME";
+@@ -87,7 +103,11 @@
+ 				@config-SEQ {
+ 					description = "NAME";
+ 					firmware = "atf";
+-					loadables = "scp", "uboot";
++//#ifdef CONFIG_SUNXI_OPTEE_DTB					
++					loadables = "tee", "scp", "uboot";
++//#else
++//					loadables = "scp", "uboot";
++//#endif
+ 					fdt = "fdt-SEQ";
+ 				};
+ 			};
+diff --git a/arch/arm/include/asm/arch-sunxi/clock_sun6i.h b/arch/arm/include/asm/arch-sunxi/clock_sun6i.h
+index ee387127f3..ca6eff7a0d 100644
+--- a/arch/arm/include/asm/arch-sunxi/clock_sun6i.h
++++ b/arch/arm/include/asm/arch-sunxi/clock_sun6i.h
+@@ -11,17 +11,17 @@
+ #define _SUNXI_CLOCK_SUN6I_H
+ 
+ struct sunxi_ccm_reg {
+-	u32 pll1_cfg;		/* 0x00 pll1 control */
++	u32 pll1_cfg;		/* 0x00 pll1 control - CPUX*/ 
+ 	u32 reserved0;
+-	u32 pll2_cfg;		/* 0x08 pll2 control */
++	u32 pll2_cfg;		/* 0x08 pll2 control - Audio*/ //
+ 	u32 reserved1;
+-	u32 pll3_cfg;		/* 0x10 pll3 control */
++	u32 pll3_cfg;		/* 0x10 pll3 control - Video0*/
+ 	u32 reserved2;
+-	u32 pll4_cfg;		/* 0x18 pll4 control */
++	u32 pll4_cfg;		/* 0x18 pll4 control - VE*/
+ 	u32 reserved3;
+-	u32 pll5_cfg;		/* 0x20 pll5 control */
++	u32 pll5_cfg;		/* 0x20 pll5 control - DDR0*/
+ 	u32 reserved4;
+-	u32 pll6_cfg;		/* 0x28 pll6 control */
++	u32 pll6_cfg;		/* 0x28 pll6 control - PERIPH0*/
+ 	u32 reserved5;
+ 	u32 pll7_cfg;		/* 0x30 pll7 control */
+ 	u32 sata_pll_cfg;	/* 0x34 SATA pll control (R40 only) */
+@@ -232,7 +232,7 @@ struct sunxi_ccm_reg {
+ #define CCM_PLL6_CTRL_N_MASK		(0x1f << CCM_PLL6_CTRL_N_SHIFT)
+ #define CCM_PLL6_CTRL_K_SHIFT		4
+ #define CCM_PLL6_CTRL_K_MASK		(0x3 << CCM_PLL6_CTRL_K_SHIFT)
+-#define CCM_PLL6_CTRL_LOCK		(1 << 28)
++#define CCM_PLL6_CTRL_LOCK			(1 << 28)
+ 
+ #define CCM_SATA_PLL_DEFAULT		0x90005811 /* 100 MHz */
+ 
+diff --git a/arch/arm/include/asm/arch-sunxi/dram_sunxi_dw.h b/arch/arm/include/asm/arch-sunxi/dram_sunxi_dw.h
+index a5a7ebde44..e843c14202 100644
+--- a/arch/arm/include/asm/arch-sunxi/dram_sunxi_dw.h
++++ b/arch/arm/include/asm/arch-sunxi/dram_sunxi_dw.h
+@@ -215,12 +215,17 @@ struct sunxi_mctl_ctl_reg {
+ #define NR_OF_BYTE_LANES	(32 / BITS_PER_BYTE)
+ /* The eight data lines (DQn) plus DM, DQS and DQSN */
+ #define LINES_PER_BYTE_LANE	(BITS_PER_BYTE + 3)
+-struct dram_para {
++
++struct rank_para {
+ 	u16 page_size;
+-	u8 bus_full_width;
+-	u8 dual_rank;
+ 	u8 row_bits;
+ 	u8 bank_bits;
++};
++
++struct dram_para {
++	u8 dual_rank;
++	u8 bus_full_width;
++	struct rank_para ranks[2];
+ 	const u8 dx_read_delays[NR_OF_BYTE_LANES][LINES_PER_BYTE_LANE];
+ 	const u8 dx_write_delays[NR_OF_BYTE_LANES][LINES_PER_BYTE_LANE];
+ 	const u8 ac_delays[31];
+diff --git a/arch/arm/mach-sunxi/Kconfig b/arch/arm/mach-sunxi/Kconfig
+index 49ef217f08..99a3e238ff 100644
+--- a/arch/arm/mach-sunxi/Kconfig
++++ b/arch/arm/mach-sunxi/Kconfig
+@@ -1016,4 +1016,11 @@ config PINEPHONE_DT_SELECTION
+ 	  Enable this option to automatically select the device tree for the
+ 	  correct PinePhone hardware revision during boot.
+ 
++config SUNXI_OPTEE_DTB
++	bool "Enable OPTEE TEE DTB generation during u-boot binary compilation"
++	depends on MACH_SUN50I
++	help
++	  Enables the FIT DTB to include OPTEE blob that is externally generated.
++	  Also patches tee-pager_v2.bin to u-boot-sunxi-with-spl.bin binary file.
++
+ endif
+diff --git a/arch/arm/mach-sunxi/clock_sun6i.c b/arch/arm/mach-sunxi/clock_sun6i.c
+index 8e84062bd7..74b6992400 100644
+--- a/arch/arm/mach-sunxi/clock_sun6i.c
++++ b/arch/arm/mach-sunxi/clock_sun6i.c
+@@ -88,9 +88,9 @@ void clock_init_uart(void)
+ 		(struct sunxi_ccm_reg *)SUNXI_CCM_BASE;
+ 
+ 	/* uart clock source is apb2 */
+-	writel(APB2_CLK_SRC_OSC24M|
+-	       APB2_CLK_RATE_N_1|
+-	       APB2_CLK_RATE_M(1),
++	writel(APB2_CLK_SRC_PLL6|
++	       APB2_CLK_RATE_N_2|
++	       APB2_CLK_RATE_M(12),
+ 	       &ccm->apb2_div);
+ 
+ 	/* open the clock for uart */
+diff --git a/arch/arm/mach-sunxi/dram_sunxi_dw.c b/arch/arm/mach-sunxi/dram_sunxi_dw.c
+index d0600011ff..7d4d78e9c9 100644
+--- a/arch/arm/mach-sunxi/dram_sunxi_dw.c
++++ b/arch/arm/mach-sunxi/dram_sunxi_dw.c
+@@ -399,18 +399,24 @@ static void mctl_set_cr(uint16_t socid, struct dram_para *para)
+ #else
+ #error Unsupported DRAM type!
+ #endif
+-	       (para->bank_bits == 3 ? MCTL_CR_EIGHT_BANKS : MCTL_CR_FOUR_BANKS) |
++	       (para->ranks[0].bank_bits == 3 ? MCTL_CR_EIGHT_BANKS : MCTL_CR_FOUR_BANKS) |
+ 	       MCTL_CR_BUS_FULL_WIDTH(para->bus_full_width) |
+ 	       (para->dual_rank ? MCTL_CR_DUAL_RANK : MCTL_CR_SINGLE_RANK) |
+-	       MCTL_CR_PAGE_SIZE(para->page_size) |
+-	       MCTL_CR_ROW_BITS(para->row_bits), &mctl_com->cr);
++	       MCTL_CR_PAGE_SIZE(para->ranks[0].page_size) |
++	       MCTL_CR_ROW_BITS(para->ranks[0].row_bits), &mctl_com->cr);
+ 
+-	if (socid == SOCID_R40) {
+-		if (para->dual_rank)
+-			panic("Dual rank memory not supported\n");
++	if (socid == SOCID_A64 || socid == SOCID_R40) {
++		writel((para->ranks[1].bank_bits == 3 ? MCTL_CR_EIGHT_BANKS : MCTL_CR_FOUR_BANKS) |
++		       MCTL_CR_BUS_FULL_WIDTH(para->bus_full_width) |
++		       (para->dual_rank ? MCTL_CR_DUAL_RANK : MCTL_CR_SINGLE_RANK) |
++		       MCTL_CR_PAGE_SIZE(para->ranks[1].page_size) |
++		       MCTL_CR_ROW_BITS(para->ranks[1].row_bits), &mctl_com->cr_r1);
++	}
+ 
++	if (socid == SOCID_R40) {
+ 		/* Mux pin to A15 address line for single rank memory. */
+-		setbits_le32(&mctl_com->cr_r1, MCTL_CR_R1_MUX_A15);
++		if (!para->dual_rank)
++			setbits_le32(&mctl_com->cr_r1, MCTL_CR_R1_MUX_A15);
+ 	}
+ }
+ 
+@@ -646,35 +652,63 @@ static int mctl_channel_init(uint16_t socid, struct dram_para *para)
+ 	return 0;
+ }
+ 
+-static void mctl_auto_detect_dram_size(uint16_t socid, struct dram_para *para)
++/*
++ * Test if memory at offset offset matches memory at a certain base
++ */
++static bool mctl_mem_matches_base(u32 offset, ulong base)
++{
++	/* Try to write different values to RAM at two addresses */
++	writel(0, base);
++	writel(0xaa55aa55, base + offset);
++	dsb();
++	/* Check if the same value is actually observed when reading back */
++	return readl(base) ==
++	       readl(base + offset);
++}
++
++static void mctl_auto_detect_dram_size_rank(uint16_t socid, struct dram_para *para, ulong base, struct rank_para *rank)
+ {
+ 	/* detect row address bits */
+-	para->page_size = 512;
+-	para->row_bits = 16;
+-	para->bank_bits = 2;
++	rank->page_size = 512;
++	rank->row_bits = 16;
++	rank->bank_bits = 2;
+ 	mctl_set_cr(socid, para);
+ 
+-	for (para->row_bits = 11; para->row_bits < 16; para->row_bits++)
+-		if (mctl_mem_matches((1 << (para->row_bits + para->bank_bits)) * para->page_size))
++	for (rank->row_bits = 11; rank->row_bits < 16; rank->row_bits++)
++		if (mctl_mem_matches_base((1 << (rank->row_bits + rank->bank_bits)) * rank->page_size, base))
+ 			break;
+ 
+ 	/* detect bank address bits */
+-	para->bank_bits = 3;
++	rank->bank_bits = 3;
+ 	mctl_set_cr(socid, para);
+ 
+-	for (para->bank_bits = 2; para->bank_bits < 3; para->bank_bits++)
+-		if (mctl_mem_matches((1 << para->bank_bits) * para->page_size))
++	for (rank->bank_bits = 2; rank->bank_bits < 3; rank->bank_bits++)
++		if (mctl_mem_matches_base((1 << rank->bank_bits) * rank->page_size, base))
+ 			break;
+ 
+ 	/* detect page size */
+-	para->page_size = 8192;
++	rank->page_size = 8192;
+ 	mctl_set_cr(socid, para);
+ 
+-	for (para->page_size = 512; para->page_size < 8192; para->page_size *= 2)
+-		if (mctl_mem_matches(para->page_size))
++	for (rank->page_size = 512; rank->page_size < 8192; rank->page_size *= 2)
++		if (mctl_mem_matches_base(rank->page_size, base))
+ 			break;
+ }
+ 
++static unsigned long mctl_calc_rank_size(struct rank_para *rank)
++{
++	return (1UL << (rank->row_bits + rank->bank_bits)) * rank->page_size;
++}
++
++static void mctl_auto_detect_dram_size(uint16_t socid, struct dram_para *para)
++{
++	mctl_auto_detect_dram_size_rank(socid, para, (ulong)CONFIG_SYS_SDRAM_BASE, &para->ranks[0]);
++
++	if ((socid == SOCID_A64 || socid == SOCID_R40) && para->dual_rank) {
++		mctl_auto_detect_dram_size_rank(socid, para, (ulong)CONFIG_SYS_SDRAM_BASE + mctl_calc_rank_size(&para->ranks[0]), &para->ranks[1]);
++	}
++}
++
+ /*
+  * The actual values used here are taken from Allwinner provided boot0
+  * binaries, though they are probably board specific, so would likely benefit
+@@ -769,12 +803,23 @@ unsigned long sunxi_dram_init(void)
+ 	struct sunxi_mctl_ctl_reg * const mctl_ctl =
+ 			(struct sunxi_mctl_ctl_reg *)SUNXI_DRAM_CTL0_BASE;
+ 
++	unsigned long size;
++
+ 	struct dram_para para = {
+ 		.dual_rank = 1,
+ 		.bus_full_width = 1,
+-		.row_bits = 15,
+-		.bank_bits = 3,
+-		.page_size = 4096,
++		.ranks = {
++			{
++				.row_bits = 15,
++				.bank_bits = 3,
++				.page_size = 4096,
++			},
++			{
++				.row_bits = 15,
++				.bank_bits = 3,
++				.page_size = 4096,
++			}
++		},
+ 
+ #if defined(CONFIG_MACH_SUN8I_H3)
+ 		.dx_read_delays  = SUN8I_H3_DX_READ_DELAYS,
+@@ -846,6 +891,13 @@ unsigned long sunxi_dram_init(void)
+ 	mctl_auto_detect_dram_size(socid, &para);
+ 	mctl_set_cr(socid, &para);
+ 
+-	return (1UL << (para.row_bits + para.bank_bits)) * para.page_size *
+-	       (para.dual_rank ? 2 : 1);
++	size = mctl_calc_rank_size(&para.ranks[0]);
++	if (socid == SOCID_A64 || socid == SOCID_R40) {
++		if (para.dual_rank)
++			size += mctl_calc_rank_size(&para.ranks[1]);
++	} else if (para.dual_rank) {
++		size *= 2;
++	}
++
++	return size;
+ }
+diff --git a/board/sunxi/board.c b/board/sunxi/board.c
+index 708a27ed78..065abfd417 100644
+--- a/board/sunxi/board.c
++++ b/board/sunxi/board.c
+@@ -693,6 +693,10 @@ void sunxi_board_init(void)
+ 	if (!gd->ram_size)
+ 		hang();
+ 
++	struct sunxi_ccm_reg *const ccm =
++		(struct sunxi_ccm_reg *)SUNXI_CCM_BASE;
++	printf("APB2 %x\n",readl(&ccm->apb2_div));
++
+ 	sunxi_spl_store_dram_size(gd->ram_size);
+ 
+ 	/*
+diff --git a/configs/pine64-lts_optee_defconfig b/configs/pine64-lts_optee_defconfig
+new file mode 100644
+index 0000000000..2e3ae27acd
+--- /dev/null
++++ b/configs/pine64-lts_optee_defconfig
+@@ -0,0 +1,16 @@
++CONFIG_ARM=y
++CONFIG_ARCH_SUNXI=y
++CONFIG_SPL=y
++CONFIG_MACH_SUN50I=y
++CONFIG_SUNXI_DRAM_LPDDR3_STOCK=y
++CONFIG_DRAM_CLK=552
++CONFIG_DRAM_ZQ=3881949
++CONFIG_MMC0_CD_PIN=""
++CONFIG_MMC_SUNXI_SLOT_EXTRA=2
++CONFIG_SPL_SPI_SUNXI=y
++CONFIG_DEFAULT_DEVICE_TREE="sun50i-a64-pine64-lts"
++# CONFIG_SYS_MALLOC_CLEAR_ON_INIT is not set
++CONFIG_SUN8I_EMAC=y
++CONFIG_USB_EHCI_HCD=y
++CONFIG_USB_OHCI_HCD=y
++CONFIG_SUNXI_OPTEE_DTB=y
+\ No newline at end of file
+diff --git a/configs/pinephone_optee_defconfig b/configs/pinephone_optee_defconfig
+new file mode 100644
+index 0000000000..64e62ba343
+--- /dev/null
++++ b/configs/pinephone_optee_defconfig
+@@ -0,0 +1,13 @@
++CONFIG_ARM=y
++CONFIG_ARCH_SUNXI=y
++CONFIG_SPL=y
++CONFIG_MACH_SUN50I=y
++CONFIG_SUNXI_DRAM_LPDDR3_STOCK=y
++CONFIG_DRAM_CLK=552
++CONFIG_DRAM_ZQ=3881949
++CONFIG_MMC_SUNXI_SLOT_EXTRA=2
++CONFIG_PINEPHONE_DT_SELECTION=y
++CONFIG_DEFAULT_DEVICE_TREE="sun50i-a64-pinephone-1.2"
++# CONFIG_SYS_MALLOC_CLEAR_ON_INIT is not set
++CONFIG_OF_LIST="sun50i-a64-pinephone-1.1 sun50i-a64-pinephone-1.2"
++CONFIG_SUNXI_OPTEE_DTB=y
+\ No newline at end of file
+diff --git a/include/configs/sunxi-common.h b/include/configs/sunxi-common.h
+index a6a4879523..82d6902ad0 100644
+--- a/include/configs/sunxi-common.h
++++ b/include/configs/sunxi-common.h
+@@ -38,7 +38,8 @@
+ /* Serial & console */
+ #define CONFIG_SYS_NS16550_SERIAL
+ /* ns16550 reg in the low bits of cpu reg */
+-#define CONFIG_SYS_NS16550_CLK		24000000
++#define CONFIG_SYS_NS16550_CLK		50000000
++//#define CONFIG_SYS_NS16550_CLK		24000000
+ #ifndef CONFIG_DM_SERIAL
+ # define CONFIG_SYS_NS16550_REG_SIZE	-4
+ # define CONFIG_SYS_NS16550_COM1		SUNXI_UART0_BASE
+diff --git a/tools/binman/etype/tee_bl32.py b/tools/binman/etype/tee_bl32.py
+new file mode 100644
+index 0000000000..e0f253213e
+--- /dev/null
++++ b/tools/binman/etype/tee_bl32.py
+@@ -0,0 +1,23 @@
++# SPDX-License-Identifier: GPL-2.0+
++# Copyright 2020 Google LLC
++# Written by Spandan Mahadevegowda <spandan@vt.edu>
++#
++# Entry-type module for TEE binary blob
++#
++
++from binman.etype.blob_named_by_arg import Entry_blob_named_by_arg
++
++class Entry_tee_bl32(Entry_blob_named_by_arg):
++    """Entry containing a Trusted Execution Environment Bl32 blob
++
++    Properties / Entry arguments:
++        - tee-bl32-path: Filename of file to read into entry. This is typically
++            called tee.bin or tee-pager_v2.bin
++
++    This entry holds the TEE firmware, typically started by ATF BL31.
++    A typical example of such a blob is OPTEE. See https://optee.readthedocs.io/en/latest/ 
++    for additional information
++    """
++    def __init__(self, section, etype, node):
++        super().__init__(section, etype, node, 'tee-bl32')
++        self.external = True
+\ No newline at end of file
