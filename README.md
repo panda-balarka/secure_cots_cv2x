@@ -14,6 +14,16 @@ The various software modules, code and other opensourced repositories are the mo
 1. The setup on the Phone or Pine64-LTS would be the same. The server now instead of on the internet would be on a private LTE network setup using USRP B200 and OAI open source repos. The Phone will use a custom SIM for the purpose
 2. Basic setup information of using OAI source code and getting custom SIM card can be found here [Open Cells Setup and SIM](https://open-cells.com/index.php/2019/09/22/all-in-one-openairinterface/)
 
+#### Server at end of EPC
+
+
+#### Server at eNB
+- We reuse the work of MEC-Middlebox Approach (https://www.usenix.org/conference/hotedge18/presentation/li)
+- Follow the instructions inside the MEC Setup and Middlebox md files to perform the part 1 setup for EDGE case testing
+- Instead of the original author's GTP source, we manually use osmo-ggsn and libgtpnl directly to setup GTP tunnels as described in the original work.
+- To setup the GTP tunnels, follow the setps below:
+  - TODO
+
 Additional detailed information to be uploaded. Instruction document is under compilation and code & artificats are being cleaned up before pushing to GIT.
 
 
