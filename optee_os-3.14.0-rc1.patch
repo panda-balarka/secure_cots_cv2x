@@ -1,0 +1,3443 @@
+diff --git a/core/arch/arm/kernel/tee_time_arm_cntpct.c b/core/arch/arm/kernel/tee_time_arm_cntpct.c
+index 112dfc3d..a6b58ec7 100644
+--- a/core/arch/arm/kernel/tee_time_arm_cntpct.c
++++ b/core/arch/arm/kernel/tee_time_arm_cntpct.c
+@@ -46,7 +46,6 @@ REGISTER_TIME_SOURCE(arm_cntpct_time_source)
+  *
+  * and adding one byte of entropy when we reach 8 rotated bits.
+  */
+-
+ void plat_prng_add_jitter_entropy(enum crypto_rng_src sid, unsigned int *pnum)
+ {
+ 	uint64_t tsc = barrier_read_counter_timer();
+diff --git a/core/arch/arm/kernel/thread.c b/core/arch/arm/kernel/thread.c
+index 4c95d3dc..8c926db6 100644
+--- a/core/arch/arm/kernel/thread.c
++++ b/core/arch/arm/kernel/thread.c
+@@ -80,7 +80,7 @@ struct thread_core_local thread_core_local[CFG_TEE_CORE_NB_CORE] __nex_bss;
+ #else
+ #define STACK_TMP_SIZE		(2048 + STACK_TMP_OFFS)
+ #endif
+-#define STACK_THREAD_SIZE	8192
++#define STACK_THREAD_SIZE	(1024 * 32)
+ 
+ #if TRACE_LEVEL > 0
+ #define STACK_ABT_SIZE		3072
+diff --git a/core/arch/arm/kernel/timer_a64.c b/core/arch/arm/kernel/timer_a64.c
+index d64a9970..bbdb6698 100644
+--- a/core/arch/arm/kernel/timer_a64.c
++++ b/core/arch/arm/kernel/timer_a64.c
+@@ -65,4 +65,4 @@ void generic_timer_handler(uint32_t time_ms)
+ 
+ 	/* Enable the secure physical timer */
+ 	write_cntps_ctl(1);
+-}
++}
+\ No newline at end of file
+diff --git a/core/arch/arm/plat-sunxi/conf.mk b/core/arch/arm/plat-sunxi/conf.mk
+index e59e1946..5e0b495e 100644
+--- a/core/arch/arm/plat-sunxi/conf.mk
++++ b/core/arch/arm/plat-sunxi/conf.mk
+@@ -30,6 +30,7 @@ ifeq ($(PLATFORM_FLAVOR),sun50i_a64)
+ include core/arch/arm/cpu/cortex-armv8-0.mk
+ $(call force,CFG_ARM64_core,y)
+ $(call force,CFG_WITH_LPAE,y)
++$(call force,CFG_GIC,y)
+ 
+ CFG_TZDRAM_START ?= 0x40000000
+ CFG_TZDRAM_SIZE  ?= 0x2000000
+diff --git a/core/arch/arm/plat-sunxi/cv2x.c b/core/arch/arm/plat-sunxi/cv2x.c
+new file mode 100644
+index 00000000..6bae4476
+--- /dev/null
++++ b/core/arch/arm/plat-sunxi/cv2x.c
+@@ -0,0 +1,585 @@
++//  -------------------------------------------------------------------------------------------------------------------------
++/*  Interrupt and CV2X periodic handler source code */
++
++//  General Required Headers
++#include <platform_config.h>
++#include <kernel/interrupt.h>
++#include <kernel/panic.h>
++#include <kernel/timer.h>
++#include <trace.h>
++#include <crypto/ascon.h>
++#include <initcall.h>
++#include <string.h>
++#include <string_ext.h>
++#include <tee/tee_cryp_utl.h>
++
++//  Internal Headers 
++#include "cv2x.h"
++
++//  -------------------------------------------------------------------------------------------------------------------------
++//  Static APIs
++/*  The state machine function of the Secure CV2X work. Send and Receive data periodically. Take action in case if threat
++ *  model discrepancies are detected */
++static void cv2x_main(void);
++/*  Disable the CV2X timer when the periodic application has to end. Mainly used for stopping CV2X application after a 
++ *  given testing period for now */
++static void disable_cv2x_timer(void);
++/*  Wrapper to compute ascon hasha hmac in single shot */
++static TEE_Result get_hmac(const uint8_t *ip_data, uint8_t key_id, uint8_t *op_buff,  uint32_t ip_size);
++
++/*  API for building and sending the dsrc message */
++static TEE_Result send_dsrc_msg(void);
++static TEE_Result recv_dsrc_packets(void); 
++
++static enum itr_return sunxi_timer1_it_handler(struct itr_handler *handler __unused);
++static enum itr_return sunxi_handle_uart3_rx(struct itr_handler *handler __unused);
++
++//  CV2X structure for the state machine
++static cv2x_st main_st = {
++    .init_flag = INIT_APP_S,
++    .m_st.m_state = AT_S,
++    .m_st.send_flg = TRUE,
++    .timer_rst_flag = TRUE,
++    .no_resp_ctr = 0,
++    .state = INIT_S,
++    .timerCtr = 0,
++};
++
++//  CV2X data structure to keep track of data entries and issues in communication
++static cv2x_data_st data_st = {
++    .msg_cntr = 0,
++    .tcp_retry_cntr = 0,
++    .full_sr_pckts = 0,
++    .num_test_msgs = 5000,
++};
++
++#if(((GET_TIME_MEASUREMENTS & GET_GPS_TIME_MEASUREMENTS) == GET_GPS_TIME_MEASUREMENTS) \
++        || ((GET_TIME_MEASUREMENTS & GET_ASN_HMAC_TIME_MEASUREMENTS) == GET_ASN_HMAC_TIME_MEASUREMENTS))
++//  Variables to measure computational overhead and delays 
++time_track_st t_1;
++time_track_st t_2;
++time_track_st t_3;
++
++// each array index has number of send-receives done in (idx+1)*TIMER_INTERRUPT_PERIOD ms
++uint16_t recv_map[NW_LATENCY_SLICES] = {0};
++#endif
++
++//  DSRC message structures, one for tx and one for rx, reuse to reduce space
++basicSafetyMessageVerbose_st rx_st;
++basicSafetyMessageVerbose_st tx_st;
++
++//  Variables to store large and repeating data
++uint8_t imei[IMEI_DATA_SIZE] = {0};
++uint8_t asn1_buffer[PACKET_MAX_SIZE] = {0};
++uint8_t buffer_size = 0;
++uint8_t cmd_resp_receive_buffer[SUNXI_UART3_FIFO_EX_SIZE] = {0};
++uint8_t gps_buffer[GPS_DATA_SIZE] = {0};
++uint8_t receive_buffer[1500] = {0};
++uint8_t hex_str_send_buffer[PACKET_HEX_STRING_SIZE] = {0};
++
++//  Keys are already stored and replicated in the CV2X server to keep things simple for POC
++uint8_t key1_au8[CV2X_KEY_SIZE] = { 0x01,0x01,0x01,0x01,0x02,0x02,0x02,0x02,0x01,0x01,0x01,0x01,0x02,0x02,0x02,0x02, 
++                                    0x01,0x01,0x01,0x01,0x02,0x02,0x02,0x02,0x01,0x01,0x01,0x01,0x02,0x02,0x02,0x02 };
++uint8_t key2_au8[CV2X_KEY_SIZE] = { 0x03,0x03,0x03,0x03,0x02,0x02,0x02,0x02,0x03,0x03,0x03,0x03,0x02,0x02,0x02,0x02, 
++                                    0x03,0x03,0x03,0x03,0x02,0x02,0x02,0x02,0x03,0x03,0x03,0x03,0x02,0x02,0x02,0x02 };
++uint8_t key3_au8[CV2X_KEY_SIZE] = { 0x04,0x04,0x04,0x04,0x02,0x02,0x02,0x02,0x04,0x04,0x04,0x04,0x02,0x02,0x02,0x02, 
++                                    0x04,0x04,0x04,0x04,0x02,0x02,0x02,0x02,0x04,0x04,0x04,0x04,0x02,0x02,0x02,0x02 };
++uint8_t *key_au8[NUM_KEYS] = {key1_au8, key2_au8, key3_au8};
++
++//  Interrupt ID for the generic ARM v8 timer (From Allwinner_A64_User_Manual_V1.1.pdf)
++//  we use the EL3 PPID 29 (AArch64 Programmer's Guide: Generic Timer - Arm Manual)
++#define GIC_SPI_SEC_TIMER 29
++
++//  Interrupt ID for UART 3 RX
++#define GIC_SPI_UART3 35
++
++struct itr_handler sunxi_timer1_handler = {
++    .it = GIC_SPI_SEC_TIMER,   
++    .handler = sunxi_timer1_it_handler,
++    .flags = ITRF_TRIGGER_LEVEL,
++    // run our CV2X application on one core    
++    .cpu_mask = 0x01,   
++};
++
++struct itr_handler uart3_rx_handler = {
++    .it = GIC_SPI_UART3,   
++    .handler = sunxi_handle_uart3_rx,
++    .flags = ITRF_TRIGGER_LEVEL,
++    // run our CV2X application on one core    
++    .cpu_mask = 0x01,   
++};
++
++//  -------------------------------------------------------------------------------------------------------------------------
++/*  Disable the CV2X timer when the periodic application has to end. Mainly used for stopping CV2X application after a 
++ *  given period of testing */
++static void disable_cv2x_timer(void)
++{   
++    // Stop timer and disable interrupt
++    IMSG("Disabling Timer Interrupt\n");
++    main_st.timer_rst_flag = FALSE;
++    generic_timer_stop();
++}
++
++/*  This is the actual timer interrupt handler routed from the GIC once once ARM-TF routes it to OPTEE GIC. For better
++ *  readability and modularity, we do the CV2X work in the state machine API */
++static enum itr_return sunxi_timer1_it_handler(struct itr_handler *handler __unused)
++{
++    //  call the application state machine
++    cv2x_main();
++    main_st.timerCtr++;
++
++    //  Acknowledge timer pending status and reset
++    (main_st.timer_rst_flag)? (generic_timer_handler(TIMER_INTERRUPT_PERIOD)): (main_st.timer_rst_flag = TRUE);
++    return ITRR_HANDLED;
++}
++
++/* CV2X State machine */
++static void cv2x_main(void)
++{
++    switch(main_st.state) {
++        case INIT_S:
++            {
++                switch(main_st.m_st.m_state) {
++                    /*  We take some considerable time to perform the modem initializations. Each state is reached a minimum 
++                        of two times, once to send and then to recieve. The functionality is determined by the send_flag in the
++                        m_st structure */
++                    //  Check modem up          
++// #if(BUILD_TYPE == BUILD_PINEPHONE)                                        
++//                     case RDY_S: 
++//                         at_recv_check(cmd_resp_receive_buffer, "RDY", &main_st.m_st, AT_S,SUNXI_UART3_FIFO_EX_SIZE);
++//                         break;
++// #endif
++#if(SETUP_BAUD)
++                    case AT_S: {
++                        (main_st.m_st.send_flg)? at_cmd_input("AT+IPR=3000000;&W\r", &main_st.m_st) : 
++                            at_recv_check(cmd_resp_receive_buffer, "OK", &main_st.m_st, AT_DIRECT_EXIT_S,SUNXI_UART3_FIFO_EX_SIZE);
++                        }
++                        break;                          
++#else       
++                    case AT_S: {
++                        (main_st.m_st.send_flg)? at_cmd_input("AT\r", &main_st.m_st) : 
++                            at_recv_check(cmd_resp_receive_buffer, "OK", &main_st.m_st, AT_ECHO_CONFIG_S,SUNXI_UART3_FIFO_EX_SIZE);
++                            IMSG("%d",AT_S);
++                        }
++                        break;
++#endif
++                    //  Disable local echoing from modem
++                    case AT_ECHO_CONFIG_S:
++                        (main_st.m_st.send_flg)? at_cmd_input("ATE0\r", &main_st.m_st) : 
++                            at_recv_check(cmd_resp_receive_buffer, "OK", &main_st.m_st, AT_CPIN_S,SUNXI_UART3_FIFO_EX_SIZE);
++                        break;
++                    //  Check if sim card has been recognised
++                    case AT_CPIN_S: {
++#if(GPS_USE_TYPE == GPS_US_DUMMY)                    
++                        (main_st.m_st.send_flg)? at_cmd_input("AT+CPIN?\r", &main_st.m_st) : 
++                            at_recv_check(cmd_resp_receive_buffer, "+CPIN: READY", &main_st.m_st, AT_IMEI_S,SUNXI_UART3_FIFO_EX_SIZE);
++                        }
++                    break;
++#else
++                        (main_st.m_st.send_flg)? at_cmd_input("AT+CPIN?\r", &main_st.m_st) : 
++                            at_recv_check(cmd_resp_receive_buffer, "+CPIN: READY", &main_st.m_st, AT_GPS_S,SUNXI_UART3_FIFO_EX_SIZE);
++                        }
++                        break;
++                    case AT_GPS_S: {
++                        at_cmd_input("AT+QGPS=1\r", &main_st.m_st);
++                        main_st.m_st.m_state = AT_GPS_FIRST_S;
++                        }
++                        break;    
++                    case AT_GPS_FIRST_S: {
++#if(APPLICATION_TYPE == RUN_GPS_ONLY)
++                        (main_st.m_st.send_flg)? at_cmd_input("AT+QGPSLOC?\r", &main_st.m_st) :
++                            at_recv_check(gps_buffer, "+QGPSLOC:", &main_st.m_st, AT_TEST_S,GPS_DATA_SIZE);
++#else
++                        (main_st.m_st.send_flg)? at_cmd_input("AT+QGPSLOC?\r", &main_st.m_st) :
++                            at_recv_check(gps_buffer, "+QGPSLOC:", &main_st.m_st, AT_IMEI_S,GPS_DATA_SIZE);
++#endif   
++                        }
++                        break;  
++#endif                
++                    //  Get IMEI number of modem and update the global IMEI Structure
++                    case AT_IMEI_S:
++                        (main_st.m_st.send_flg)? at_cmd_input("AT+CGSN\r", &main_st.m_st) : 
++                            get_imei_data(cmd_resp_receive_buffer, imei, &main_st.m_st, AT_QICSGP_S);
++                        break;
++                    //  Setup APN settings from data communication
++                    case AT_QICSGP_S:
++                        (main_st.m_st.send_flg)? at_cmd_input("AT+QICSGP=1,1,\"super\",\"\",\"\",0\r", &main_st.m_st) : 
++                        // (main_st.m_st.send_flg)? at_cmd_input("AT+QICSGP=1,1,\"ltebox\",\"\",\"\",0\r", &main_st.m_st) : 
++                            at_recv_check(cmd_resp_receive_buffer, "OK", &main_st.m_st, AT_QIACT_S,SUNXI_UART3_FIFO_EX_SIZE);  
++                        break;
++                    //  Start PDP context
++                    case AT_QIACT_S:
++                        (main_st.m_st.send_flg)? at_cmd_input("AT+QIACT=1\r", &main_st.m_st) : 
++                            at_recv_check(cmd_resp_receive_buffer, "OK", &main_st.m_st, AT_QISDE_S,SUNXI_UART3_FIFO_EX_SIZE); 
++                        break;
++                    case AT_QISDE_S:
++                        (main_st.m_st.send_flg)? at_cmd_input("AT+QISDE=0\r", &main_st.m_st) : 
++                            at_recv_check(cmd_resp_receive_buffer, "OK", &main_st.m_st, AT_QIOPEN_S,SUNXI_UART3_FIFO_EX_SIZE);
++                        break;                           
++                    //  Request TCP connection with server. Here we directly input server address to keep things simple
++                    case AT_QIOPEN_S:
++                        // (main_st.m_st.send_flg)? at_cmd_input("AT+QIOPEN=1,11,\"TCP\",\"10.0.0.1\",7891,0,0\r", &main_st.m_st) : 
++                        (main_st.m_st.send_flg)? at_cmd_input("AT+QIOPEN=1,11,\"TCP\",\"54.166.196.89\",33333,0,0\r", &main_st.m_st) :
++                        //(main_st.m_st.send_flg)? at_cmd_input("AT+QIOPEN=1,11,\"TCP\",\"38.68.237.27\",7891,0,0\r", &main_st.m_st) :  
++                            at_recv_check(cmd_resp_receive_buffer, "OK", &main_st.m_st, AT_QIOPEN_URC_S,0);
++                        break;                           
++                    //  Check if the TCP connection was successful
++                    case AT_QIOPEN_URC_S: {
++                        if((TEE_SUCCESS == (at_recv_check(cmd_resp_receive_buffer, "+QIOPEN: 11,0", &main_st.m_st, AT_QISEND_S,SUNXI_UART3_FIFO_EX_SIZE))))
++                            main_st.state = SEND_S;
++                        else {
++                            //  in case TCP connection failed, maybe server is busy, wait for a while (5*interrupt period) and then retry.
++                            data_st.tcp_retry_cntr++;
++                            if(data_st.tcp_retry_cntr == 50) {
++                                IMSG("Retrying TCP Connection");
++                                // reset tcp connection retry counter
++                                data_st.tcp_retry_cntr = 0;
++                                // send command again and try
++                                main_st.m_st.m_state = AT_QIOPEN_S;
++                            }
++                        }
++                        break;
++                    }
++#if(SETUP_BAUD)
++                    case AT_DIRECT_EXIT_S:
++                        disable_cv2x_timer();
++                        break;
++#endif
++#if(APPLICATION_TYPE == RUN_GPS_ONLY)                    
++                    case AT_TEST_S:
++                        main_st.state = SEND_S;
++                        break;                 
++#endif                            
++                    default:
++                        break;
++                }
++ //  -------------------------------------------------------------------------------------------------------------------------               
++                break;
++            }
++        /*  Send the first data packet from the UE. After this, the sequence is to receive response and immediately send the 
++            next UE data. So, we handle that is the RECEIVE_SEND_S state */
++
++        case SEND_S:
++            {          
++#if(BUILD_TYPE == BUILD_PINEPHONE)
++                if (main_st.timerCtr > 100) {
++#endif
++                    // Print a reference to the server address we are trying to connect to
++                    IMSG("Connected to 54.166.196.89:33333\n");
++                    if(TEE_SUCCESS == send_dsrc_msg()) {
++                        main_st.state = RECEIVE_SEND_S;
++                        itr_enable(uart3_rx_handler.it);
++                        modem_enable_rcv_data_int();
++                    }                    
++#if(BUILD_TYPE == BUILD_PINEPHONE)
++                }
++#endif
++#if(APPLICATION_TYPE == RUN_GPS_ONLY)                 
++                if(data_st.msg_cntr == 18000)
++                    main_st.state = EXIT_S;
++#endif
++                break;
++            }
++        case RECEIVE_SEND_S:
++            {   
++                if(data_st.data_rcv4snd_flg) {
++                    main_st.no_resp_ctr = 0;                    
++                }
++                else {          
++                    main_st.no_resp_ctr++;
++                }
++                break;
++            }
++        case ACTION_S:
++            {
++                break;
++            }
++        case EXIT_S:
++            {
++                at_cmd_input("AT+QICLOSE=11\r",&main_st.m_st);
++                while(at_recv_check(cmd_resp_receive_buffer,"OK",&main_st.m_st,AT_DEACT_S,SUNXI_UART3_FIFO_EX_SIZE));
++                at_cmd_input("AT+QIDEACT=1\r", &main_st.m_st);
++                while(at_recv_check(cmd_resp_receive_buffer,"OK",&main_st.m_st,AT_DEACT_S,SUNXI_UART3_FIFO_EX_SIZE));                
++                disable_cv2x_timer();
++                break;
++            }
++        default:
++            {
++                break;
++            }
++    }
++}
++
++static enum itr_return sunxi_handle_uart3_rx(struct itr_handler *handler __unused) {
++        TEE_Result local_res;
++
++        local_res = modem_recv_data(cmd_resp_receive_buffer);
++        // IMSG("%s",cmd_resp_receive_buffer);
++        if((TEE_SUCCESS == local_res) && (strstr(cmd_resp_receive_buffer,"+QIURC: \"recv\",11") != NULL)) {
++            // IMSG("Here?");
++            itr_disable(uart3_rx_handler.it);
++            modem_disable_rcv_data_int();   
++            recv_dsrc_packets();
++            data_st.data_rcv4snd_flg  = TRUE;
++
++            if(data_st.msg_cntr == data_st.num_test_msgs)
++                main_st.state = EXIT_S; 
++            else {
++                send_dsrc_msg();
++                itr_enable(uart3_rx_handler.it);
++                modem_enable_rcv_data_int();                 
++            }           
++        }
++
++        return ITRR_HANDLED;
++}   
++
++static TEE_Result get_hmac(const uint8_t *ip_data, uint8_t key_id, uint8_t *op_buff,  uint32_t ip_size)
++{
++    TEE_Result res = TEE_SUCCESS;
++    struct asconhasha_ctx *local_ctx = (struct asconhasha_ctx*) malloc(sizeof(struct asconhasha_ctx));
++    
++    asconhasha_hmac_init(local_ctx, key_au8[key_id], CV2X_KEY_SIZE);
++    asconhasha_hmac_update(local_ctx, ip_data, ip_size);
++    asconhasha_hmac_final(local_ctx, op_buff, 32);
++
++    free(local_ctx);
++
++    return res;
++}
++
++static TEE_Result send_dsrc_msg(void) {
++
++        TEE_Result local_res = TEE_ERROR_GENERIC;
++        uint64_t nonce;     
++        uint32_t truncated_nonce;   
++        uint8_t hmac_buffer[HMAC_OP_SIZE] = {0};
++        cord_st c_st;
++
++#if(((GET_TIME_MEASUREMENTS & GET_GPS_TIME_MEASUREMENTS) == GET_GPS_TIME_MEASUREMENTS) \
++        || ((GET_TIME_MEASUREMENTS & GET_ASN_HMAC_TIME_MEASUREMENTS) == GET_ASN_HMAC_TIME_MEASUREMENTS))
++        time_val_st tm;  
++        time_val_st tn;
++        time_val_st tp;
++        IMSG("BSM Number %ld",data_st.msg_cntr);
++#endif
++
++
++#if((GET_TIME_MEASUREMENTS & GET_GPS_TIME_MEASUREMENTS) == GET_GPS_TIME_MEASUREMENTS)
++        getpct_value(&t_1.t1);
++#endif
++#if(APPLICATION_TYPE == RUN_GPS_ONLY)
++        at_cmd_input("AT+QGPSLOC?\r", &main_st.m_st);
++#endif
++        get_gps_data(gps_buffer, &c_st);
++#if((GET_TIME_MEASUREMENTS & GET_GPS_TIME_MEASUREMENTS) == GET_GPS_TIME_MEASUREMENTS)       
++        getpct_value(&t_1.t2);
++        get_time_measurements(&t_1,&tm);
++        IMSG("GPS Fetch Overhead - Read %d: %lds, %ldms, %ldus",data_st.msg_cntr, tm.seconds, tm.millis, tm.micros);
++#if(APPLICATION_TYPE == RUN_GPS_ONLY)
++        data_st.msg_cntr ++;
++        return TEE_SUCCESS;        
++#endif
++#endif
++
++#if((GET_TIME_MEASUREMENTS & GET_ASN_HMAC_TIME_MEASUREMENTS) == GET_ASN_HMAC_TIME_MEASUREMENTS) 
++        getpct_value(&t_1.t1);
++#endif
++        // message type
++        asn1_buffer[DSRC_TYPE_POS] = BSM_VERBOSE_DSRC;
++        // key id of key used
++        asn1_buffer[KEY_ID_POS] = data_st.msg_cntr % NUM_KEYS;
++        // imei data of UE
++        memcpy(&asn1_buffer[IMEI_POS], imei, IMEI_DATA_SIZE);
++        // dsrc packet
++        TA_ASN1_ENCODER(BSM_VERBOSE_DSRC, data_st.msg_cntr, &tx_st, &asn1_buffer[PACKET_HEADER_SIZE], &buffer_size, &c_st);
++        // update dsrc packet data
++        asn1_buffer[PACKET_SIZE_POS] = buffer_size;
++        // nonce (timstamp)
++        getpct_value(&nonce);
++        truncated_nonce = (uint32_t)nonce;
++        memcpy(&asn1_buffer[PACKET_HEADER_SIZE + buffer_size], &truncated_nonce, NONCE_TIMESTAMP_SIZE);
++        // get hmac of all data
++        get_hmac(asn1_buffer, (data_st.msg_cntr % NUM_KEYS), hmac_buffer, (buffer_size + PACKET_HEADER_SIZE + NONCE_TIMESTAMP_SIZE)); 
++        // append hmac to packet
++        memcpy(&asn1_buffer[PACKET_HEADER_SIZE + buffer_size + NONCE_TIMESTAMP_SIZE], hmac_buffer, HMAC_OP_SIZE);              
++
++        uint16_t at_len = (PACKET_HEADER_SIZE + buffer_size + NONCE_TIMESTAMP_SIZE + HMAC_OP_SIZE);            
++        hex_byte_arr_to_str(asn1_buffer,at_len,&hex_str_send_buffer[PACKET_HEX_DATA_OFFSET],TRUE);
++        append_atsendex_cmnd(hex_str_send_buffer);         
++
++#if((GET_TIME_MEASUREMENTS & GET_ASN_HMAC_TIME_MEASUREMENTS) == GET_ASN_HMAC_TIME_MEASUREMENTS) 
++        getpct_value(&t_1.t2);
++        getpct_value(&t_2.t1);
++#endif
++        at_cmd_input(hex_str_send_buffer, &main_st.m_st);
++#if((GET_TIME_MEASUREMENTS & GET_ASN_HMAC_TIME_MEASUREMENTS) == GET_ASN_HMAC_TIME_MEASUREMENTS) 
++        getpct_value(&t_2.t2);
++        getpct_value(&t_3.t1);
++#endif
++        while(modem_recv_data(cmd_resp_receive_buffer));
++        if(strstr(cmd_resp_receive_buffer,"SEND OK") != NULL) {
++            data_st.msg_cntr++;
++            local_res = TEE_SUCCESS;           
++            data_st.data_rcv4snd_flg = FALSE; 
++        }
++        else
++            IMSG("Send NOT OK");
++#if((GET_TIME_MEASUREMENTS & GET_ASN_HMAC_TIME_MEASUREMENTS) == GET_ASN_HMAC_TIME_MEASUREMENTS) 
++        getpct_value(&t_3.t2);
++        get_time_measurements(&t_3,&tp);
++        get_time_measurements(&t_2,&tn);
++        get_time_measurements(&t_1,&tm);
++        IMSG("DSRC+HMAC_Send Overhead %lds, %ldms, %ldus",tm.seconds,tm.millis,tm.micros);        
++        IMSG("Send Packet to Modem %lds, %ldms, %ldus",tn.seconds,tn.millis,tn.micros);  
++        IMSG("Sync. With Modem to Verify Send %lds, %ldms, %ldus",tp.seconds,tp.millis,tp.micros);  
++        getpct_value(&t_1.t1);
++#endif        
++        memzero_explicit(hmac_buffer,HMAC_OP_SIZE); 
++        memzero_explicit(asn1_buffer,PACKET_MAX_SIZE);
++        memzero_explicit(hex_str_send_buffer,PACKET_HEX_STRING_SIZE);
++        memzero_explicit(&tx_st,sizeof(tx_st));
++        memzero_explicit(cmd_resp_receive_buffer,SUNXI_UART3_FIFO_EX_SIZE);
++        modem_clear_ip_buffer();
++
++        return local_res;
++}
++
++static TEE_Result recv_dsrc_packets(void) {
++#if((GET_TIME_MEASUREMENTS & GET_ASN_HMAC_TIME_MEASUREMENTS) == GET_ASN_HMAC_TIME_MEASUREMENTS) 
++    time_val_st tm;  
++    time_val_st tn;
++    time_val_st tp;
++    getpct_value(&t_1.t2);
++    get_time_measurements(&t_1,&tm);
++    IMSG("Network Latency %lds, %ldms, %ldus",tm.seconds,tm.millis,tm.micros);
++    getpct_value(&t_1.t1);
++#endif
++    // TODO: Change to array or strings based on number of bsms in receive payload for automated testing 
++    // or use QIRD with len = 0 and fetch the length (could lead ot errors if full data is not received)
++    // at_cmd_input("AT+QIRD=11,114\r",&main_st.m_st);
++    at_cmd_input("AT+QIRD=11,0\r",&main_st.m_st);
++    while(modem_recv_data(cmd_resp_receive_buffer));
++    modem_clear_ip_buffer();
++    uint8_t digits = 0;
++    uint32_t num_resp_bytes = get_qird_data_len(cmd_resp_receive_buffer,&digits);
++    memset(cmd_resp_receive_buffer, 0x00, sizeof(cmd_resp_receive_buffer));
++    append_recv_cmd(cmd_resp_receive_buffer, num_resp_bytes, digits);
++    IMSG("Command is %s", cmd_resp_receive_buffer);
++    at_cmd_input(cmd_resp_receive_buffer,&main_st.m_st);
++    // the server always sends a BSM pacaket with security overhead of 113 bytes. 1 additional byte for holding the number of BSMs in the overall packet
++    // read_recv_data(receive_buffer,(data_st.num_recv_bsm*113)+1);
++    read_recv_data(receive_buffer,num_resp_bytes);
++    memzero_explicit(cmd_resp_receive_buffer, SUNXI_UART3_FIFO_EX_SIZE); 
++
++#if((GET_TIME_MEASUREMENTS & GET_ASN_HMAC_TIME_MEASUREMENTS) == GET_ASN_HMAC_TIME_MEASUREMENTS) 
++    getpct_value(&t_1.t2);
++    get_time_measurements(&t_1,&tm);    
++#endif
++    uint32_t p_idx = 0; // parsing idx
++    uint8_t num_bsm = receive_buffer[p_idx];
++    uint8_t pckt_decoded = 0;
++    p_idx++;
++    while(pckt_decoded < num_bsm) {
++#if((GET_TIME_MEASUREMENTS & GET_ASN_HMAC_TIME_MEASUREMENTS) == GET_ASN_HMAC_TIME_MEASUREMENTS) 
++        getpct_value(&t_2.t1);  
++#endif      
++        uint8_t asn_packet_size = receive_buffer[p_idx+PACKET_SIZE_POS];
++        uint8_t packet_size = PACKET_HEADER_SIZE + asn_packet_size + NONCE_TIMESTAMP_SIZE + HMAC_OP_SIZE;
++        memcpy(asn1_buffer,&receive_buffer[p_idx], packet_size);
++        uint8_t hmac_temp[HMAC_OP_SIZE] = {0};
++        get_hmac(asn1_buffer, asn1_buffer[KEY_ID_POS], hmac_temp, (packet_size - HMAC_OP_SIZE));                 
++        if(memcmp(hmac_temp,&asn1_buffer[packet_size - HMAC_OP_SIZE], HMAC_OP_SIZE)) {
++            IMSG("HMAC Error");
++        }
++        else {
++            data_st.full_sr_pckts++;
++            TA_ASN1_DECODER(BSM_VERBOSE_DSRC, &rx_st, &asn1_buffer[PACKET_HEADER_SIZE]);
++        }
++        p_idx += packet_size;
++        pckt_decoded++;
++#if((GET_TIME_MEASUREMENTS & GET_ASN_HMAC_TIME_MEASUREMENTS) == GET_ASN_HMAC_TIME_MEASUREMENTS) 
++        getpct_value(&t_2.t2);
++        memcpy(&tp,&tn,sizeof(time_val_st));
++        get_time_measurements(&t_2,&tn);
++        tn.seconds =  ((tp.seconds*(pckt_decoded-1)) + tn.seconds)/pckt_decoded;
++        tn.millis  =  ((tp.millis*(pckt_decoded-1)) + tn.millis)/pckt_decoded;
++        tn.micros  =  ((tp.micros*(pckt_decoded-1)) + tn.micros)/pckt_decoded;
++#endif            
++    } 
++    if(data_st.full_sr_pckts == num_bsm) {
++        IMSG("FULL SR's Done %d", data_st.full_sr_pckts);
++        data_st.full_sr_pckts = 0;
++    }
++    else
++        IMSG("FULL SR Error, %d packets HMAC error", (num_bsm-data_st.full_sr_pckts));
++#if((GET_TIME_MEASUREMENTS & GET_ASN_HMAC_TIME_MEASUREMENTS) == GET_ASN_HMAC_TIME_MEASUREMENTS) 
++    IMSG("DSRC+HMAC_Send Overhead (Per-BSM) %lds, %ldms, %ldus",tn.seconds,tn.millis,tn.micros);        
++    IMSG("Recv Packet From Modem %lds, %ldms, %ldus",tm.seconds,tm.millis,tm.micros);  
++#endif
++    return TEE_SUCCESS;
++}
++
++void app_rerun(void) {
++    // disable timer in case we have abruptly stopped the application previously
++    disable_cv2x_timer();
++    // reset main_st values
++    main_st.m_st.m_state = AT_S;
++    main_st.m_st.send_flg = TRUE;
++    main_st.timer_rst_flag = TRUE;
++    main_st.no_resp_ctr = 0;
++    main_st.state = INIT_S;
++    main_st.timerCtr = 0;
++
++    // reset data_st values
++    data_st.msg_cntr = 0;
++    data_st.tcp_retry_cntr = 0;
++    data_st.full_sr_pckts = 0;
++
++    itr_enable(sunxi_timer1_handler.it);
++    generic_timer_start(100);  
++}
++
++
++TEE_Result init_suxi_timer1(void)
++{   
++    if (main_st.init_flag == INIT_APP_S){
++        // startup modem and check gps etc before calling cv2x app in the case of phone.
++        configure_modem_sunxi_a64();
++
++        // in the case of pine sbc, the modem is already powered from the GPIO. We can start the timer interrupt to start configuration
++#if(BUILD_TYPE != BUILD_PINEPHONE)
++        //IMSG("Adding Interrupt\n"); 
++        itr_add_cpumask(&sunxi_timer1_handler);
++        itr_add_cpumask(&uart3_rx_handler);
++        IMSG("Added Interrupts \n");
++        itr_enable(sunxi_timer1_handler.it);
++        generic_timer_start(100);        
++        IMSG("Enabled secure timer interrupt and assigned handlers\n"); 
++#endif        
++        main_st.init_flag = INIT_APP_RUN_S;
++    }   
++    else if(main_st.init_flag == INIT_APP_RUN_S) {
++#if(BUILD_TYPE == BUILD_PINEPHONE)
++        //IMSG("Adding Interrupt\n"); 
++        itr_add_cpumask(&sunxi_timer1_handler);
++        itr_add_cpumask(&uart3_rx_handler);
++        IMSG("Added Interrupts \n");
++        itr_enable(sunxi_timer1_handler.it);
++        generic_timer_start(100);        
++        IMSG("Enabled secure timer interrupt and assigned handlers\n"); 
++#else   
++        app_rerun();
++#endif
++        main_st.init_flag = INIT_APP_RERUN_S;
++    }
++    else if(main_st.init_flag == INIT_APP_RERUN_S) {
++        app_rerun();
++    }
++    else {
++        EMSG("Invalid CV2X App state\n");
++    }
++
++    return TEE_SUCCESS;
++}
++
+diff --git a/core/arch/arm/plat-sunxi/cv2x.h b/core/arch/arm/plat-sunxi/cv2x.h
+new file mode 100644
+index 00000000..133f684d
+--- /dev/null
++++ b/core/arch/arm/plat-sunxi/cv2x.h
+@@ -0,0 +1,274 @@
++#ifndef _CV2X_H_
++#define _CV2X_H_
++
++#include <kernel/tee_time.h>
++#include <mm/core_mmu.h>
++#include <mm/core_memprot.h>
++#include <io.h>
++
++#include "dsrc.h"
++
++/*-------------------------------------------- DEFINES AND DECLARATIONS -------------------------------------------*/
++//  GENERAL ---------------------------------------------------------------------------------------------------------
++#ifndef TRUE
++#define TRUE 1
++#endif
++#ifndef FALSE
++#define FALSE 0
++#endif
++
++#define SETUP_BAUD 0
++
++//  Macros to computer and print overheads and time measurements
++#define GET_NO_TIME_MEASUREMENTS        0x0000
++#define GET_GPS_TIME_MEASUREMENTS       0x0001
++#define GET_ASN_HMAC_TIME_MEASUREMENTS  0x0010
++#define GET_TIME_MEASUREMENTS (GET_ASN_HMAC_TIME_MEASUREMENTS)
++
++//  GPS HW use binding
++#define GPS_USE_HW      TRUE
++#define GPS_US_DUMMY    FALSE
++#define GPS_USE_TYPE    GPS_US_DUMMY
++
++//  Application execution type binding
++#define RUN_GPS_ONLY    0x0001
++#define RUN_FULL        0x0010
++#define APPLICATION_TYPE  RUN_FULL
++
++//  Device specific code selection macro
++#define BUILD_PINE64    0x01
++#define BUILD_PINEPHONE 0x10
++#define BUILD_TYPE      BUILD_PINEPHONE   
++
++//  Number of timer interrupt ranges we try to map
++#define NW_LATENCY_SLICES 11
++
++
++// TIMER ------------------------------------------------------------------------------------------------------------
++#define TIMER_INTERRUPT_PERIOD  100
++
++// MODEM ------------------------------------------------------------------------------------------------------------
++//  ### port/gpio related ###
++#define SUNXI_A64_GPIO_BASE                 0x01C20800
++
++#define SUNXI_A64_GPIO_PORTB_CFGREG_BASE    (SUNXI_A64_GPIO_BASE + 0x24)
++#define SUNXI_A64_GPIO_PORTC_CFGREG_BASE    (SUNXI_A64_GPIO_BASE + 0x48)
++#define SUNXI_A64_GPIO_PORTD_CFGREG_BASE    (SUNXI_A64_GPIO_BASE + 0x6C)
++#define SUNXI_A64_GPIO_PORTE_CFGREG_BASE    (SUNXI_A64_GPIO_BASE + 0x90)
++#define SUNXI_A64_GPIO_PORTF_CFGREG_BASE    (SUNXI_A64_GPIO_BASE + 0xB4)
++#define SUNXI_A64_GPIO_PORTG_CFGREG_BASE    (SUNXI_A64_GPIO_BASE + 0xD8)
++#define SUNXI_A64_GPIO_PORTH_CFGREG_BASE    (SUNXI_A64_GPIO_BASE + 0xFC)
++
++#define SUNXI_A64_GPIO_REG_BASE_SIZE        1024    
++#define SUNXI_A64_GPIO_PORTD_PULL_REG_BASE  SUNXI_A64_GPIO_BASE + 0x88
++#define SUNXI_A64_GPIO_PORTB_DATA_REG_BASE  SUNXI_A64_GPIO_BASE + 0x34
++
++#define NUM_PIN_PER_PORT_REG    8
++#define NUM_PIN_PER_PORT_DATA   32
++#define PORT_REG_OFFSET_CFG(_x) (_x*0x04)
++#define PORT_DATA_REG_OFFSET    0x10
++
++#define PORTB_CFG0_PB3_CLR_MASK  0xFFFF0FFF
++#define PORTB_CFG0_PB3_OP_VAL    0x1000
++#define PORTD_CFG0_TXRX_CLR_MASK 0xFFFFFF00
++#define PORTD_CFG0_TXRX_SET_VAL  0x33
++#define PORTD_PULL_RX_CLR_MASK   0xFFFFFF0F
++#define PORTD_PULL_RX_SET_VAL    (1<<2)
++
++#define PORT_PIN_HIGH            1
++#define PORT_PIN_LOW             0
++
++#define PB3_SET_HIGH             (PORT_PIN_HIGH<<3)
++#define PB3_SET_LOW              (PORT_PIN_LOW<<3)
++
++//  ### clocking related ###
++#define SUNXI_A64_CCU_BASE          0x01C20000
++#define SUNXI_A64_CCU_REQ_REG_SIZE  0x324
++#define CCU_APB2_GATE_REG_OFFSET    0x6C
++#define CCU_APB2_RESET_REG_OFFSET   0x2D8
++
++#define UART3_RESET_BIT_POS         19
++#define UART3_GATE_SET_POS          19
++
++//  ### uart 3 related ###
++#define SUNXI_UART3_FIFO_SIZE       64
++#define SUNXI_UART3_FIFO_EX_SIZE    (SUNXI_UART3_FIFO_SIZE + 1) // 1 byte for '\0' character to be used in modem APIs
++#define SUNXI_A64_UART3_BASE        0x01C28C00
++#define SUNXI_A64_UART3_REG_SIZE    0x400
++#define SUNXI_A64_UART3_CLK_IN_HZ	50000000
++
++#if(SETUP_BAUD)
++#define SUNXI_UART3_BAUDRATE		115200
++#else
++#define SUNXI_UART3_BAUDRATE		3000000
++#endif
++
++//  ### modem command related ###
++#define QI_SENDEX_CMD_LEN   15
++#define QI_SEND_CMD_LEN     13
++#define QIRD_READ_RESP_DEF_BYTES_SIZE 11 
++#define QGPS_RESP_DEF_BYTES_SIZE      14 
++
++typedef enum {
++    DIR_IN,
++    DIR_OUT,
++}port_dir;
++
++typedef enum {
++    RDY_S,              // 0
++    AT_S,               // 1
++    AT_ECHO_CONFIG_S,   // 2
++    AT_CPIN_S,          // 3
++    AT_GPS_S,           // 4
++    AT_GPS_FIRST_S,     // 5
++    AT_IMEI_S,          // 6
++    AT_QICSGP_S,        // 7
++    AT_QIACT_S,         // 8
++    AT_QIOPEN_S,        // 9
++    AT_QISDE_S,         // 10
++    AT_QIOPEN_URC_S,    // 11
++    AT_QISEND_S,        // 12
++    AT_QIRD_URC_S,      // 13
++    AT_QIRD_S,          // 14
++    AT_QICLOSE_S,       // 15
++    AT_DEACT_S,         // 16
++    AT_TEST_S,          // 17
++#if(SETUP_BAUD)
++    AT_DIRECT_EXIT_S,
++#endif
++}modem_state;
++
++typedef struct {
++    bool send_flg;
++    modem_state m_state;
++}modem_ctrl;
++
++typedef struct modem_uart_ops {
++    int (*init)(uintptr_t base_addr, uint32_t clock, uint32_t baud);
++    int (*putc)(int c, uintptr_t base_addr);
++    int (*getc)(uintptr_t base_addr, uint8_t *byt_validity);
++    void (*flush)(uintptr_t base_addr);
++    void (*enint_rx)(uintptr_t base_addr);
++    void (*diint_rx)(uintptr_t base_addr);
++} uart_ops_t;
++
++// MAIN -------------------------------------------------------------------------------------------------------------
++#define CV2X_KEY_SIZE   32
++#define NUM_KEYS        3
++#define HMAC_OP_SIZE    32
++#define GPS_DATA_SIZE   200
++
++// imei is 15 digit number, here we consider this to be already in hex notation and store it in 8 bytes
++#define DSRC_MSG_TYPE_SIZE      1
++#define KEY_ID_SIZE             1
++#define IMEI_DATA_SIZE          8 
++#define PACKET_SIZE             1  
++#define PACKET_HEADER_SIZE      (DSRC_MSG_TYPE_SIZE + KEY_ID_SIZE + IMEI_DATA_SIZE + PACKET_SIZE)
++#define BSM_DATA_MAX_SIZE       74
++#define NONCE_TIMESTAMP_SIZE    4
++#define PACKET_MAX_SIZE         (PACKET_HEADER_SIZE + BSM_DATA_MAX_SIZE + NONCE_TIMESTAMP_SIZE + HMAC_OP_SIZE)
++
++#define DSRC_TYPE_POS           0
++#define KEY_ID_POS              (DSRC_TYPE_POS + DSRC_MSG_TYPE_SIZE)    // 1
++#define IMEI_POS                (KEY_ID_POS + KEY_ID_SIZE)              // 2
++#define PACKET_SIZE_POS         (IMEI_POS + IMEI_DATA_SIZE)             // 10
++#define ASN_PACKET_POS          (PACKET_SIZE_POS + PACKET_SIZE)         // 11
++
++
++#define PACKET_HEX_STRING_BUFFER_SIZE 30
++#define PACKET_HEX_STRING_SIZE  ((2*PACKET_MAX_SIZE) + QI_SENDEX_CMD_LEN + PACKET_HEX_STRING_BUFFER_SIZE) // 3 bytes for 2 double quotes and null character
++#define PACKET_HEX_DATA_OFFSET  QI_SENDEX_CMD_LEN
++
++typedef enum {
++    INIT_S,
++    SEND_S,
++    RECEIVE_SEND_S,
++    CHECK_INTEGRITY_S,
++    ACTION_S,
++    EXIT_S,
++}cv2x_state;
++
++typedef enum {
++    INIT_APP_S,
++    INIT_APP_RUN_S,
++    INIT_APP_RERUN_S,
++}app_state;
++
++typedef struct {
++    app_state init_flag;
++    modem_ctrl m_st;
++    cv2x_state state;
++    uint8_t no_resp_ctr;
++    uint32_t hmac_ary[5];
++    bool timer_rst_flag;
++    uint64_t timerCtr;
++} cv2x_st;
++
++typedef struct {
++    uint64_t msg_cntr;
++    uint32_t tcp_retry_cntr;
++    bool data_rcv4snd_flg;
++    uint8_t full_sr_pckts;
++    uint8_t num_recv_bsm;
++    uint16_t num_test_msgs;
++} cv2x_data_st;
++
++typedef struct {
++    uint64_t seconds;
++	uint64_t millis;
++	uint64_t micros;
++} time_val_st;
++
++typedef struct {
++	uint64_t t1;
++	uint64_t t2;
++} time_track_st;
++
++
++/*----------------------------------------------------- APIS -----------------------------------------------------*/
++//  TIMER ----------------------------------------------------------------------------------------------------------
++TEE_Result init_suxi_timer1(void);
++
++//  MODEM ----------------------------------------------------------------------------------------------------------
++TEE_Result configure_modem_sunxi_a64(void);
++TEE_Result modem_send_data(uint8_t *s);
++TEE_Result modem_recv_data(uint8_t *s);
++void modem_enable_rcv_data_int(void);
++void modem_disable_rcv_data_int(void);
++TEE_Result modem_send_data_wlen(uint8_t *s, uint32_t data_len);
++void modem_send_char(int8_t ch_c);
++uint8_t modem_get_char(void);
++uint32_t get_qird_data_len(uint8_t *qird_resp, uint8_t *num_digs);
++void modem_flush(void);
++void modem_clear_ip_buffer(void);
++TEE_Result at_recv_check(uint8_t *buf, uint8_t *res, modem_ctrl *m_st, modem_state next_state, uint16_t buf_clear_len);
++void at_cmd_input(uint8_t *cmnd, modem_ctrl *m_st);
++TEE_Result get_imei_data(uint8_t *buf, uint8_t *imei_buf, modem_ctrl *m_st, modem_state next_state);
++TEE_Result read_recv_data(uint8_t *s, uint32_t read_len);
++TEE_Result read_recv_data2(uint8_t *s, uint32_t read_len);
++TEE_Result read_till_string(uint8_t *s, uint8_t *ip, uint8_t ip_len);
++TEE_Result get_gps_data(uint8_t *s, cord_st *c_tst);
++void lat_lon_alt(uint8_t *s, uint32_t *lat, uint32_t *lon, uint16_t *alt);
++
++void append_atsendex_cmnd(uint8_t *hex_str);
++void append_send_cmd(uint8_t *hex_str, uint32_t data_len);
++void append_recv_cmd(uint8_t *hex_str, uint32_t num_bytes, uint8_t digs);
++void hex_byte_arr_to_str(uint8_t *hex_arr, uint32_t arr_size, uint8_t *hex_str, bool modem_flag);
++
++int uart_core_init(uintptr_t base_addr, uint32_t clock, uint32_t baud);
++int uart_core_putc(int c, uintptr_t base_addr);
++int uart_core_getc(uintptr_t base_addr, uint8_t *byt_validity);
++void uart_core_flush(uintptr_t base_addr);
++void uart_int_en(uintptr_t base_addr);
++void uart_int_di(uintptr_t base_addr);
++
++//  HELPERS --------------------------------------------------------------------------------------------------------
++void getpct_value(uint64_t *var_u64);
++void load_cntfreq_value(void);
++void get_time_measurements(time_track_st *time_st, time_val_st *cal_st);
++void set_gpio_direction(uint32_t port_base_addr, uint32_t pin, port_dir dir);
++void set_gpio_direction_output(uint32_t port_base_addr, uint32_t pin, uint8_t pin_val);
++void set_gpio_out_value(uint32_t port_base_addr, uint32_t pin, uint8_t pin_val);
++uint32_t get_port_value(uint32_t port_base_addr);
++
++#endif /* #ifndef _CV2X_H_ */
+diff --git a/core/arch/arm/plat-sunxi/cv2x_helpers.c b/core/arch/arm/plat-sunxi/cv2x_helpers.c
+new file mode 100644
+index 00000000..603a0756
+--- /dev/null
++++ b/core/arch/arm/plat-sunxi/cv2x_helpers.c
+@@ -0,0 +1,51 @@
++
++#include <arm.h>
++
++#include "cv2x.h"
++
++void getpct_value(uint64_t *var_u64){
++	*var_u64 = barrier_read_counter_timer();
++}
++
++void get_time_measurements(time_track_st *time_st, time_val_st *cal_st) {
++	uint64_t t1 = time_st->t1;
++	uint64_t t2 = time_st->t2;
++	uint32_t cntfrq = read_cntfrq();
++
++	cal_st->seconds = (t2-t1) / cntfrq;
++	cal_st->millis	 = ((t2-t1) * 1000)/ cntfrq;
++	cal_st->micros	 = ((t2-t1) * 1000000)/ cntfrq;
++}
++
++void set_gpio_direction_output(uint32_t port_base_addr, uint32_t pin, uint8_t pin_val) {
++	//	set the pin to output
++	set_gpio_direction(port_base_addr, pin, DIR_OUT);
++	//	set its value
++	set_gpio_out_value(port_base_addr, pin, pin_val);
++}
++
++void set_gpio_direction(uint32_t port_base_addr, uint32_t pin, port_dir dir) {
++	uint8_t reg_num = (uint8_t)(pin/NUM_PIN_PER_PORT_REG);
++	uint8_t pin_num = (uint8_t)(pin%NUM_PIN_PER_PORT_REG);
++	vaddr_t cfg_reg_addr = (vaddr_t)phys_to_virt(port_base_addr, MEM_AREA_IO_NSEC) + PORT_REG_OFFSET_CFG(reg_num);
++
++	if(dir == DIR_IN)
++		io_write32(cfg_reg_addr, io_read32(cfg_reg_addr) & ~(0xF<<(pin_num*4)));
++	else if(dir == DIR_OUT)
++		io_write32(cfg_reg_addr, (io_read32(cfg_reg_addr) & ~(0xF<<(pin_num*4))) | (0x1<<(pin_num*4)));
++	else
++		EMSG("Unknown Pin Direction Setup");
++}
++
++void set_gpio_out_value(uint32_t port_base_addr, uint32_t pin, uint8_t pin_val) {
++	vaddr_t data_reg_addr = (vaddr_t)phys_to_virt(port_base_addr, MEM_AREA_IO_NSEC) + PORT_DATA_REG_OFFSET;
++
++	io_write32(data_reg_addr, (io_read32(data_reg_addr) & ~(0x1<<(pin))) | (pin_val<<(pin)));
++}
++
++uint32_t get_port_value(uint32_t port_base_addr) {
++	vaddr_t data_reg_addr = (vaddr_t)phys_to_virt(port_base_addr, MEM_AREA_IO_NSEC) + PORT_DATA_REG_OFFSET;
++
++	return io_read32(data_reg_addr);
++}
++
+diff --git a/core/arch/arm/plat-sunxi/dsrc.c b/core/arch/arm/plat-sunxi/dsrc.c
+new file mode 100644
+index 00000000..29d233bc
+--- /dev/null
++++ b/core/arch/arm/plat-sunxi/dsrc.c
+@@ -0,0 +1,234 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <tee_api.h>
++
++#include "dsrc.h"
++
++// Temporary data section for testing functionality
++static uint8_t accelSet_tempArray[7] = {0x01,0x23,0x45,0x60,0x12,0x34,0x56};
++static uint8_t getData_tempArray_au8[100] = {
++                                0x30, 0x40, 0x80, 0x01, 0x03, 0x81, 0x01, 0x01, 0x82, 0x04, 0x56,
++0x34, 0x12, 0x65, 0x83, 0x01, 0x01, 0x84, 0x02, 0x5a, 0x23, 0x85, 0x02, 0x64, 0x12, 0x86, 0x02,
++0x00, 0xF0, 0x87, 0x04, 0xff, 0xff, 0x01, 0xfe, 0x88, 0x02, 0x10, 0xfe, 0x89, 0x01, 0x40, 0x8a, 
++0x01, 0x01, 0x8b, 0x07, 0x01, 0x23, 0x45, 0x60, 0x12, 0x34, 0x56, 0x8c, 0x02, 0xff, 0xff, 0xad, 
++0x06, 0x80, 0x01, 0x01, 0x81, 0x01, 0x05
++};
++
++static TEE_Result updateASNBuffer(uint8_t *data_au8, uint16_t mxDataSize_u16, 
++            uint8_t *asnBuffer_au8, uint16_t *idx_u16,uint8_t updateType, uint8_t *elem_tag_u8);
++static TEE_Result getBER_elementData(uint8_t *dest_au8,uint8_t *asnBuffer_au8,uint8_t *idx_u8,
++    uint8_t *elem_tag_u8,uint8_t loadType);
++
++// Temp API: Replace with FX that gets value from GPS module
++TEE_Result generateBSM_data(basicSafetyMessageVerbose_st *bsm_tst, uint32_t msg_cntr, cord_st *c_tst)
++{
++    bsm_tst->dsrc_msgtype = BSM_VERBOSE_DSRC;
++    bsm_tst->bsm_msgcnt = (uint8_t)msg_cntr % 256;
++    bsm_tst->bsm_id = 0x65123456;
++    bsm_tst->bsm_secMark = 1;
++    bsm_tst->bsm_lat = c_tst->lat;
++    bsm_tst->bsm_long = c_tst->lon;
++    bsm_tst->bsm_elev = c_tst->alt;
++    bsm_tst->bsm_positionalAccuracy = 0xFE01FFFF;
++    bsm_tst->bsm_speed = 0xFE10;
++    bsm_tst->bsm_heading = 0x0040;
++    bsm_tst->bsm_steeringWheelAngle = 0x01;
++    memcpy(bsm_tst->bsm_accelSet,accelSet_tempArray,7);
++    bsm_tst->bsm_brakes = 0xFFFF;
++    bsm_tst->bsm_size.width = 0x01;
++    bsm_tst->bsm_size.length = 0x05;
++
++    return TEE_SUCCESS;
++}
++
++// Temp API: Replace with FX that receives ASN.1 data from the HMAC verification APi 
++// after data is received from the baseband modem
++/*
++TEE_Result getBSM_data(uint8_t *asnBuff_au8,uint8_t bufferSize_u8)
++{
++    // Handle buffer size mismatches later while copying
++    memcpy(asnBuff_au8,getData_tempArray_au8,sizeof(getData_tempArray_au8));
++
++    return TEE_SUCCESS;
++}*/
++
++static TEE_Result updateASNBuffer(uint8_t *data_au8, uint16_t mxDataSize_u16, 
++            uint8_t *asnBuffer_au8, uint16_t *idx_u16,uint8_t updateType, uint8_t *elem_tag_u8)
++{
++
++    uint16_t reqDataSize_u16 = mxDataSize_u16;
++
++    if (updateType == BER_HEAD)
++    {
++        memcpy(&asnBuffer_au8[*idx_u16],data_au8,reqDataSize_u16);
++        *idx_u16 += reqDataSize_u16 + DSRC_BER_LENGTH_TAG_LENGTH;
++    }
++    // If we have a new sequence within given sequence, reset Element tag to 0x80
++    else if (updateType == BER_SEQUENCE)
++    {
++        *elem_tag_u8 = DSRC_ELEMENT_START_TAG;
++        memcpy(&asnBuffer_au8[*idx_u16],data_au8,reqDataSize_u16);
++        *idx_u16 += reqDataSize_u16 + DSRC_BER_LENGTH_TAG_LENGTH;
++    }
++    else if(updateType == BER_ELEMENT)
++    {
++        // use a flag to handle the 0x00 after non-zero bytes arising from endianess issue 
++        uint8_t found_u8 = 0;
++        asnBuffer_au8[*idx_u16] = *elem_tag_u8;
++        *idx_u16 += DSRC_BER_ELEM_TAG_LENGTH;
++        for (int ref=0; ref<mxDataSize_u16; ref++)
++        {
++            if (data_au8[ref] == 0x00 && found_u8)
++            {
++                reqDataSize_u16 -= 1;   
++            }
++            if (data_au8[ref] != 0x00 && !found_u8)
++                found_u8 = 1;
++        }
++        asnBuffer_au8[*idx_u16] = reqDataSize_u16;
++        *idx_u16 += DSRC_BER_LENGTH_TAG_LENGTH;
++        *elem_tag_u8 += DSRC_BER_ELEMENT_INCR_VAL;
++        memcpy(&asnBuffer_au8[*idx_u16],data_au8,reqDataSize_u16);
++        *idx_u16 += reqDataSize_u16;        
++    }
++    else if(updateType == BER_LENGTH_UPDATE){
++        asnBuffer_au8[mxDataSize_u16] = 0;
++    }
++
++    return TEE_SUCCESS;
++}
++
++/* API to perfrom BER encoding as per ASN1 schema */
++TEE_Result TA_ASN1_ENCODER(uint8_t msgType_u8, uint32_t msg_cntr, uint8_t *dsrc_st, uint8_t *asnBuff_au8, uint8_t *data_size, cord_st *c_tst)
++{
++    // Main index to iterate over data
++    uint16_t idx_u16 = 0;
++    // Temporary buffer to load non-array values to use common API to update ASN1 buffer
++    uint8_t temp_au8[10] =  {0};
++    if (msgType_u8 == BSM_VERBOSE_DSRC)
++    {
++        basicSafetyMessageVerbose_st *bsm_tst = (basicSafetyMessageVerbose_st*)dsrc_st;
++        generateBSM_data(bsm_tst, msg_cntr, c_tst);
++        uint8_t elem_tag_u8 = DSRC_ELEMENT_START_TAG;
++
++        // Update BER packet head
++        temp_au8[0] = DSRC_BER_HEAD_TAG;
++        updateASNBuffer(temp_au8, DSRC_BER_HEAD_TAG_LENGTH, asnBuff_au8, &idx_u16, BER_HEAD, &elem_tag_u8);
++        // Update the totalPacket size at the end based on other data as this varies based on data
++        updateASNBuffer((uint8_t*)&(bsm_tst->dsrc_msgtype), sizeof(bsm_tst->dsrc_msgtype), asnBuff_au8, &idx_u16, BER_ELEMENT, &elem_tag_u8);
++        updateASNBuffer((uint8_t*)&(bsm_tst->bsm_msgcnt), sizeof(bsm_tst->bsm_msgcnt), asnBuff_au8, &idx_u16, BER_ELEMENT, &elem_tag_u8);
++        updateASNBuffer((uint8_t*)&(bsm_tst->bsm_id), sizeof(bsm_tst->bsm_id), asnBuff_au8, &idx_u16, BER_ELEMENT, &elem_tag_u8);
++        updateASNBuffer((uint8_t*)&(bsm_tst->bsm_secMark), sizeof(bsm_tst->bsm_secMark), asnBuff_au8, &idx_u16, BER_ELEMENT, &elem_tag_u8);
++        updateASNBuffer((uint8_t*)&(bsm_tst->bsm_lat), sizeof(bsm_tst->bsm_lat), asnBuff_au8, &idx_u16, BER_ELEMENT, &elem_tag_u8);
++        updateASNBuffer((uint8_t*)&(bsm_tst->bsm_long), sizeof(bsm_tst->bsm_long), asnBuff_au8, &idx_u16, BER_ELEMENT, &elem_tag_u8);
++        updateASNBuffer((uint8_t*)&(bsm_tst->bsm_elev), sizeof(bsm_tst->bsm_elev), asnBuff_au8, &idx_u16, BER_ELEMENT, &elem_tag_u8);
++        updateASNBuffer((uint8_t*)&(bsm_tst->bsm_positionalAccuracy), sizeof(bsm_tst->bsm_positionalAccuracy), asnBuff_au8, &idx_u16, BER_ELEMENT, &elem_tag_u8);
++        updateASNBuffer((uint8_t*)&(bsm_tst->bsm_speed), sizeof(bsm_tst->bsm_speed), asnBuff_au8, &idx_u16, BER_ELEMENT, &elem_tag_u8);
++        updateASNBuffer((uint8_t*)&(bsm_tst->bsm_heading), sizeof(bsm_tst->bsm_heading), asnBuff_au8, &idx_u16, BER_ELEMENT, &elem_tag_u8);
++        updateASNBuffer((uint8_t*)&(bsm_tst->bsm_steeringWheelAngle), sizeof(bsm_tst->bsm_steeringWheelAngle), asnBuff_au8, &idx_u16, BER_ELEMENT, &elem_tag_u8);
++        updateASNBuffer((uint8_t*)&(bsm_tst->bsm_accelSet), sizeof(bsm_tst->bsm_accelSet), asnBuff_au8, &idx_u16, BER_ELEMENT, &elem_tag_u8);
++        updateASNBuffer((uint8_t*)&(bsm_tst->bsm_brakes), sizeof(bsm_tst->bsm_brakes), asnBuff_au8, &idx_u16, BER_ELEMENT, &elem_tag_u8);
++        // Create subseqeunce for vehicle size and take reference to update length byte
++        temp_au8[0] =  DSRC_BER_SEQ_TAG;
++        updateASNBuffer(temp_au8,DSRC_BER_SEQ_TAG_LENGTH,asnBuff_au8,&idx_u16,BER_SEQUENCE,&elem_tag_u8);
++        uint8_t idx_ref_subseq1_u16 = idx_u16;
++        updateASNBuffer((uint8_t*)&(bsm_tst->bsm_size.width), sizeof(bsm_tst->bsm_size.width), asnBuff_au8, &idx_u16, BER_ELEMENT, &elem_tag_u8);
++        updateASNBuffer((uint8_t*)&(bsm_tst->bsm_size.length), sizeof(bsm_tst->bsm_size.length), asnBuff_au8, &idx_u16, BER_ELEMENT, &elem_tag_u8);
++        // update subsequence length byte
++        asnBuff_au8[idx_ref_subseq1_u16 - 1] = idx_u16 - idx_ref_subseq1_u16;
++
++        // all subsequences and elements done, update packet body length byte
++        asnBuff_au8[DSRC_BER_PAYLOAD_LENGTH_POS] = idx_u16-DSRC_BER_HEAD_TAG_LENGTH-DSRC_BER_SEQ_TAG_LENGTH;
++        *data_size = idx_u16;
++        /*
++        for (int i = 0; i < idx_u16; i++)
++            IMSG("%02x ",asnBuff_au8[i]); */
++    }
++    return TEE_SUCCESS;
++}
++
++
++TEE_Result getBER_elementData(uint8_t *dest_au8,uint8_t *asnBuffer_au8,uint8_t *idx_u8,
++    uint8_t *elem_tag_u8,uint8_t loadType)
++{
++    if(loadType == BER_VALIDATE_LOAD_SEQUENCE)
++    {
++        if (asnBuffer_au8[*idx_u8]!=DSRC_BER_SEQ_TAG)
++        {
++            EMSG("Error!, Mismatch in sequence tag\n");
++            return TEE_SUCCESS;
++        }
++        *idx_u8 +=DSRC_BER_SEQ_TAG_LENGTH+DSRC_BER_LENGTH_TAG_LENGTH;
++        // reset subsequence tag
++        *elem_tag_u8 = DSRC_ELEMENT_START_TAG;
++    }
++    else if(loadType == BER_VALIDATE_LOAD_ELEMENT)
++    {
++        if (asnBuffer_au8[*idx_u8]!=*elem_tag_u8)
++        {
++            EMSG("Error!, Mismatch in element sequence\n");
++            return 0;
++        }
++
++        *idx_u8 += DSRC_BER_ELEM_TAG_LENGTH;
++        uint8_t dataSize_u8 = asnBuffer_au8[*idx_u8];
++        *idx_u8 += DSRC_BER_LENGTH_TAG_LENGTH;
++        memcpy(dest_au8,&asnBuffer_au8[*idx_u8],dataSize_u8);
++        *elem_tag_u8 += DSRC_BER_ELEMENT_INCR_VAL;
++        *idx_u8 += dataSize_u8;
++        return TEE_SUCCESS;      
++    }
++    return TEE_SUCCESS;
++}
++
++TEE_Result TA_ASN1_DECODER(uint8_t msgType_u8, uint8_t *dsrc_st, uint8_t *asnBuff_au8)
++{   
++
++    //uint8_t *asnBuff_au8 = getData_tempArray_au8;
++    if(msgType_u8 == BSM_VERBOSE_DSRC)
++    {
++        uint8_t payload_len_u8;
++        basicSafetyMessageVerbose_st *bsm_tst = (basicSafetyMessageVerbose_st*)dsrc_st;
++
++        if (asnBuff_au8[0] != DSRC_BER_HEAD_TAG)
++        {
++            EMSG("Error: Data is not BER encoded. Found Unknown BER_HEAD_TAG");
++            return 0;
++        }
++        
++        payload_len_u8 = asnBuff_au8[DSRC_BER_PAYLOAD_LENGTH_POS];
++        uint8_t elem_tag_u8 = DSRC_ELEMENT_START_TAG;
++        //uint8_t tempBuff_u8[10] = {0};
++        // the first two bytes have already been used, so we start after the payload length byte
++        uint8_t idx_u16 = DSRC_BER_HEAD_TAG_LENGTH + DSRC_BER_LENGTH_TAG_LENGTH;
++        // load the element details to the structure
++        getBER_elementData((uint8_t*)&(bsm_tst->dsrc_msgtype),asnBuff_au8,&idx_u16,&elem_tag_u8,BER_VALIDATE_LOAD_ELEMENT);
++        getBER_elementData((uint8_t*)&(bsm_tst->bsm_msgcnt),asnBuff_au8,&idx_u16,&elem_tag_u8,BER_VALIDATE_LOAD_ELEMENT);
++        getBER_elementData((uint8_t*)&(bsm_tst->bsm_id),asnBuff_au8,&idx_u16,&elem_tag_u8,BER_VALIDATE_LOAD_ELEMENT);
++        getBER_elementData((uint8_t*)&(bsm_tst->bsm_secMark),asnBuff_au8,&idx_u16,&elem_tag_u8,BER_VALIDATE_LOAD_ELEMENT);
++        getBER_elementData((uint8_t*)&(bsm_tst->bsm_lat),asnBuff_au8,&idx_u16,&elem_tag_u8,BER_VALIDATE_LOAD_ELEMENT);
++        getBER_elementData((uint8_t*)&(bsm_tst->bsm_long),asnBuff_au8,&idx_u16,&elem_tag_u8,BER_VALIDATE_LOAD_ELEMENT);
++        getBER_elementData((uint8_t*)&(bsm_tst->bsm_elev),asnBuff_au8,&idx_u16,&elem_tag_u8,BER_VALIDATE_LOAD_ELEMENT);
++        getBER_elementData((uint8_t*)&(bsm_tst->bsm_positionalAccuracy),asnBuff_au8,&idx_u16,&elem_tag_u8,BER_VALIDATE_LOAD_ELEMENT);
++        getBER_elementData((uint8_t*)&(bsm_tst->bsm_speed),asnBuff_au8,&idx_u16,&elem_tag_u8,BER_VALIDATE_LOAD_ELEMENT);
++        getBER_elementData((uint8_t*)&(bsm_tst->bsm_heading),asnBuff_au8,&idx_u16,&elem_tag_u8,BER_VALIDATE_LOAD_ELEMENT);
++        getBER_elementData((uint8_t*)&(bsm_tst->bsm_steeringWheelAngle),asnBuff_au8,&idx_u16,&elem_tag_u8,BER_VALIDATE_LOAD_ELEMENT);        
++        getBER_elementData((uint8_t*)&(bsm_tst->bsm_accelSet),asnBuff_au8,&idx_u16,&elem_tag_u8,BER_VALIDATE_LOAD_ELEMENT);
++        getBER_elementData((uint8_t*)&(bsm_tst->bsm_brakes),asnBuff_au8,&idx_u16,&elem_tag_u8,BER_VALIDATE_LOAD_ELEMENT);
++        getBER_elementData(NULL,asnBuff_au8,&idx_u16,&elem_tag_u8,BER_VALIDATE_LOAD_SEQUENCE);
++        getBER_elementData((uint8_t*)&(bsm_tst->bsm_size.width),asnBuff_au8,&idx_u16,&elem_tag_u8,BER_VALIDATE_LOAD_ELEMENT);
++        getBER_elementData((uint8_t*)&(bsm_tst->bsm_size.length),asnBuff_au8,&idx_u16,&elem_tag_u8,BER_VALIDATE_LOAD_ELEMENT);                
++    }
++    return TEE_SUCCESS;
++}
++
++/* Internal Testing Function
++int main()
++{
++    TA_ASN1_ENCODER(BSM_VERBOSE_DSRC);
++    printf("\n");
++    TA_ASN1_DECODER(BSM_VERBOSE_DSRC);
++    printf("\n");
++    return 0;
++} */
+diff --git a/core/arch/arm/plat-sunxi/dsrc.h b/core/arch/arm/plat-sunxi/dsrc.h
+new file mode 100644
+index 00000000..fc8453fc
+--- /dev/null
++++ b/core/arch/arm/plat-sunxi/dsrc.h
+@@ -0,0 +1,95 @@
++#ifndef __DSRC_H
++#define __DSRC_H
++
++#include <tee_api_types.h>
++
++// ASN1 TAG DEFINES
++/*  every tag has a length byte. Since current data is mostly limited to size, 0x00-0xFF the length byte
++    byte is always 1 (hence it is hardcoded) */
++#define DSRC_BER_LENGTH_TAG_LENGTH  0x01
++#define DSRC_BER_HEAD_TAG_LENGTH    0x01
++#define DSRC_BER_SEQ_TAG_LENGTH     0x01
++#define DSRC_BER_ELEM_TAG_LENGTH    0x01
++
++#define DSRC_BER_ELEMENT_INCR_VAL   0x01
++
++#define DSRC_BER_HEAD_TAG           0x30
++#define DSRC_BER_SEQ_TAG            0xAD 
++#define DSRC_ELEMENT_START_TAG      0x80
++
++#define DSRC_BER_PAYLOAD_LENGTH_POS 0x01
++
++enum BER_Extract_enum{
++    // generateBSM_data actions
++    BER_HEAD,
++    BER_SEQUENCE,
++    BER_ELEMENT,
++    BER_LENGTH_UPDATE,
++
++    //getBET_elementData actions
++    BER_VALIDATE_LOAD_ELEMENT,
++    BER_VALIDATE_LOAD_SEQUENCE
++};
++
++enum DSRC_MessageType_enum{
++    RESERVED_DSRC,
++    ALACARTEMESSAGE_DSRC,
++    BSM_DSRC,
++    BSM_VERBOSE_DSRC,
++    CSM_DSRC,
++    EVA_DSRC,
++    ICA_DSRC,
++    MAPDATA_DSRC,
++    NMEACORRECTIONS_DSRC,
++    PDM_DSRC,
++    PVD_DSRC,
++    RSA_DSRC,
++    RTCMCORRECTIONS_DSRC,
++    SPTM_DSRC,
++    SRM_DSRC,
++    SSM_DSRC,
++    TRAVELERINFORMATION_DSRC
++};
++
++typedef struct __attribute__((packed)){
++    uint8_t width;
++    uint8_t length;
++}bsmVehicleSize_St;
++
++typedef struct __attribute__((aligned(4))){
++    uint8_t  dsrc_msgtype; 
++    uint8_t  bsm_msgcnt;
++    uint32_t bsm_id;
++    uint8_t  bsm_secMark;
++    uint32_t bsm_lat;
++    uint32_t bsm_long;
++    uint16_t bsm_elev;
++    uint32_t bsm_positionalAccuracy;
++    uint16_t bsm_speed;
++    uint16_t bsm_heading;
++    uint8_t  bsm_steeringWheelAngle;
++    uint8_t  bsm_accelSet[7];
++    uint16_t bsm_brakes;
++    bsmVehicleSize_St bsm_size;
++}basicSafetyMessageVerbose_st;
++
++typedef union{
++    // reserved_st;
++    // bsm_st;
++    basicSafetyMessageVerbose_st bsmv_st;
++    // add other dsrc_message structures as required
++}dsrcMessage_u;
++
++typedef struct {
++    uint32_t lat;
++    uint32_t lon;
++    uint16_t alt;
++} cord_st;
++
++TEE_Result generateBSM_data(basicSafetyMessageVerbose_st *bsm_tst, uint32_t msg_cntr, cord_st *c_tst);
++TEE_Result getBSM_data(uint8_t *asnBuff_au8, uint8_t bufferSize_u8);
++TEE_Result TA_ASN1_ENCODER(uint8_t msgType_u8, uint32_t msg_cntr, uint8_t *dsrc_st, uint8_t *asnBuff_au8, uint8_t *data_size, cord_st *c_tst);
++TEE_Result TA_ASN1_DECODER(uint8_t msgType_u8, uint8_t *dsrc_st, uint8_t *asnBuff_au8);
++
++
++#endif  /* end of _DRSC_H_ */
+\ No newline at end of file
+diff --git a/core/arch/arm/plat-sunxi/main.c b/core/arch/arm/plat-sunxi/main.c
+index 4c192ddd..2c265ac2 100644
+--- a/core/arch/arm/plat-sunxi/main.c
++++ b/core/arch/arm/plat-sunxi/main.c
+@@ -38,11 +38,13 @@
+ #include <kernel/misc.h>
+ #include <kernel/panic.h>
+ #include <kernel/tz_ssvce_def.h>
++#include <kernel/interrupt.h>
+ #include <mm/core_mmu.h>
+ #include <mm/core_memprot.h>
+ #include <mm/tee_pager.h>
+ #include <platform_config.h>
+ #include <sm/optee_smc.h>
++#include <cv2x.h>
+ 
+ #ifdef GIC_BASE
+ register_phys_mem_pgdir(MEM_AREA_IO_SEC, GIC_BASE, CORE_MMU_PGDIR_SIZE);
+@@ -53,6 +55,13 @@ register_phys_mem_pgdir(MEM_AREA_IO_NSEC,
+ 			CONSOLE_UART_BASE, SUNXI_UART_REG_SIZE);
+ #endif
+ 
++register_phys_mem_pgdir(MEM_AREA_IO_NSEC, 
++						SUNXI_A64_UART3_BASE, SUNXI_A64_UART3_REG_SIZE);
++register_phys_mem_pgdir(MEM_AREA_IO_NSEC, 
++						SUNXI_A64_GPIO_BASE, SUNXI_A64_GPIO_REG_BASE_SIZE);	
++register_phys_mem_pgdir(MEM_AREA_IO_NSEC, 
++						SUNXI_A64_CCU_BASE, SUNXI_A64_CCU_REQ_REG_SIZE);																		
++
+ #ifdef SUNXI_TZPC_BASE
+ register_phys_mem_pgdir(MEM_AREA_IO_SEC, SUNXI_TZPC_BASE, SUNXI_TZPC_REG_SIZE);
+ #define REG_TZPC_SMTA_DECPORT0_STA_REG      (0x0004)
+@@ -124,7 +133,8 @@ static inline void tzpc_init(void)
+ }
+ #endif /* SUNXI_TZPC_BASE */
+ 
+-#ifndef CFG_WITH_ARM_TRUSTED_FW
++#ifdef GIC_BASE
++
+ void main_init_gic(void)
+ {
+ 	vaddr_t gicc_base;
+@@ -137,16 +147,29 @@ void main_init_gic(void)
+ 		panic();
+ 
+ 	/* Initialize GIC */
++#if defined(CFG_WITH_ARM_TRUSTED_FW)
++	/* On ARMv8, GIC configuration is initialized in ARM-TF */
++	gic_init_base_addr(&gic_data, gicc_base, gicd_base);
++#else
+ 	gic_init(&gic_data, gicc_base, gicd_base);
++#endif
+ 	itr_init(&gic_data.chip);
+ }
+ 
++#if !defined(CFG_WITH_ARM_TRUSTED_FW)
+ void main_secondary_init_gic(void)
+ {
+ 	gic_cpu_init(&gic_data);
+ }
+ #endif
+ 
++void itr_core_handler(void)
++{
++	gic_it_handle(&gic_data);
++}
++
++#endif
++
+ #ifdef ARM32
+ void plat_primary_init_early(void)
+ {
+diff --git a/core/arch/arm/plat-sunxi/modem.c b/core/arch/arm/plat-sunxi/modem.c
+new file mode 100644
+index 00000000..a6f9554f
+--- /dev/null
++++ b/core/arch/arm/plat-sunxi/modem.c
+@@ -0,0 +1,533 @@
++#include <trace.h>
++#include <string.h>
++#include <kernel/delay.h>
++#include <initcall.h>
++
++#include "cv2x.h"
++#include "dsrc.h"
++
++static const uart_ops_t modem_ops_st = {
++    .init = uart_core_init,
++    .putc = uart_core_putc,
++    .getc = uart_core_getc,
++    .flush = uart_core_flush,
++    .enint_rx = uart_int_en,
++    .diint_rx = uart_int_di,
++};
++DECLARE_KEEP_PAGER(modem_ops_st);
++
++static vaddr_t uart3_base;
++TEE_Result configure_modem_sunxi_a64(void)
++{   
++#if(BUILD_TYPE == BUILD_PINEPHONE)
++    /*  The native arch linux has modem-power kernel module that starts up the modem, but for initialization uses the UART3 with interrupts.
++     *  We need some synchronization mechnism for not redoing the init twice and linking UART3 to rich OS. Instead we start the modem on the
++     *  secure side with vbat-bb set to be always turned on in the Linux DTB. Rich OS can talk to the modem on the USB i/f's while the secure
++     *  side uses UART3 */
++    // set directions of the pins to control and power up modem
++    // cts PD5
++    set_gpio_direction_output(SUNXI_A64_GPIO_PORTD_CFGREG_BASE, 5, 1); 
++    // rts PD4
++    set_gpio_direction_output(SUNXI_A64_GPIO_PORTD_CFGREG_BASE, 4, 1);     
++    // ap_ready/host_ready PH7
++    set_gpio_direction_output(SUNXI_A64_GPIO_PORTH_CFGREG_BASE, 7, 1); 
++    // disable W_DISABLE PH8
++    set_gpio_direction_output(SUNXI_A64_GPIO_PORTH_CFGREG_BASE, 8, 0); 
++    // reset PC4
++    set_gpio_direction_output(SUNXI_A64_GPIO_PORTC_CFGREG_BASE, 4, 0);     
++    // modem_pwrkey PB3
++    set_gpio_direction_output(SUNXI_A64_GPIO_PORTB_CFGREG_BASE, 3, 0);
++    // dtr PB2
++    set_gpio_direction_output(SUNXI_A64_GPIO_PORTB_CFGREG_BASE, 2, 0);
++    mdelay(50);
++
++    set_gpio_out_value(SUNXI_A64_GPIO_PORTB_CFGREG_BASE, 3, 1);
++    mdelay(200);
++    set_gpio_out_value(SUNXI_A64_GPIO_PORTB_CFGREG_BASE, 3, 0);
++    IMSG("Powered on Modem on PinePhone");
++#endif
++
++    // change the GPIO PORT-D P0 and P1 settings for UART3
++    vaddr_t gpio_portd_cfg_base = (vaddr_t)phys_to_virt(SUNXI_A64_GPIO_PORTD_CFGREG_BASE, MEM_AREA_IO_NSEC);
++    vaddr_t cfg0_addr = gpio_portd_cfg_base + PORT_REG_OFFSET_CFG(0);
++    vaddr_t pull0_addr = (vaddr_t)phys_to_virt(SUNXI_A64_GPIO_PORTD_PULL_REG_BASE, MEM_AREA_IO_NSEC);
++    // set pins to UART TX/RX mode
++    io_write32( cfg0_addr, ((io_read32(cfg0_addr) & PORTD_CFG0_TXRX_CLR_MASK) | PORTD_CFG0_TXRX_SET_VAL));
++    // set RX to pull-up
++    io_write32( pull0_addr, ((io_read32(pull0_addr) & PORTD_PULL_RX_CLR_MASK)  | PORTD_PULL_RX_SET_VAL));
++
++    // enable clock to UART3 
++    vaddr_t ccu_base = (vaddr_t)phys_to_virt(SUNXI_A64_CCU_BASE, MEM_AREA_IO_NSEC);
++    io_write32( ccu_base+CCU_APB2_GATE_REG_OFFSET, io_read32(ccu_base+CCU_APB2_GATE_REG_OFFSET) | (1<<UART3_GATE_SET_POS));
++    io_write32( ccu_base+CCU_APB2_RESET_REG_OFFSET, io_read32(ccu_base+CCU_APB2_RESET_REG_OFFSET) | (1<<UART3_GATE_SET_POS));
++    
++    uart3_base = (vaddr_t)phys_to_virt(SUNXI_A64_UART3_BASE, MEM_AREA_IO_NSEC);
++    modem_ops_st.init(uart3_base, SUNXI_A64_UART3_CLK_IN_HZ, SUNXI_UART3_BAUDRATE);
++
++    return TEE_SUCCESS;
++}
++
++void modem_enable_rcv_data_int(void) {
++    uart3_base = (vaddr_t)phys_to_virt(SUNXI_A64_UART3_BASE, MEM_AREA_IO_NSEC);
++
++    modem_ops_st.enint_rx(uart3_base);
++}
++
++void modem_disable_rcv_data_int(void) {
++    uart3_base = (vaddr_t)phys_to_virt(SUNXI_A64_UART3_BASE, MEM_AREA_IO_NSEC);
++
++    modem_ops_st.diint_rx(uart3_base);
++}
++
++TEE_Result modem_send_data(uint8_t *s)
++{  
++    uart3_base = (vaddr_t)phys_to_virt(SUNXI_A64_UART3_BASE, MEM_AREA_IO_NSEC);
++
++    while(*s != '\0')
++    {
++        modem_ops_st.putc(*s,uart3_base);
++        ++s;
++    }
++
++    return TEE_SUCCESS;
++}
++
++TEE_Result modem_send_data_wlen(uint8_t *s, uint32_t data_len)
++{  
++    uart3_base = (vaddr_t)phys_to_virt(SUNXI_A64_UART3_BASE, MEM_AREA_IO_NSEC);
++    uint32_t tmp = 0;
++    int8_t ref;
++    ref = s;
++
++    for(tmp = 0; tmp<data_len; tmp++, ++ref)
++        modem_ops_st.putc(ref,uart3_base);
++
++
++    return TEE_SUCCESS;
++}
++DECLARE_KEEP_PAGER(modem_send_data_wlen);
++
++// Unused -- Cleanup
++void modem_send_char(int8_t ch_c)
++{
++    uart3_base = (vaddr_t)phys_to_virt(SUNXI_A64_UART3_BASE, MEM_AREA_IO_NSEC);
++    modem_ops_st.putc(ch_c, uart3_base);
++}
++
++void modem_flush(void)
++{
++    uart3_base = (vaddr_t)phys_to_virt(SUNXI_A64_UART3_BASE, MEM_AREA_IO_NSEC);
++    modem_ops_st.flush(uart3_base);
++}
++
++/*  API to parse modem response and extract response/data */
++TEE_Result modem_recv_data(uint8_t *s)
++{
++    uart3_base = (vaddr_t)phys_to_virt(SUNXI_A64_UART3_BASE, MEM_AREA_IO_NSEC);
++    TEE_Result res = TEE_ERROR_NO_DATA;
++    /*  we mainly use this for at command responses, so there are no hex bytes, we can ignore the 
++        check for 0xff */
++    uint8_t valid_ff_flag;
++
++    int8_t *ref;
++    bool newline_flag = FALSE;
++    uint8_t newline_counter = 0;
++    ref = s;
++    
++    /*  The modem sends responses in the format /n/r<RESPONSE>/r/n. Therefore parse until two new line charecters. 
++        Then append null charecter to create output string */
++    while((*ref = modem_ops_st.getc(uart3_base,&valid_ff_flag)) != -1 || newline_flag)
++    {   
++        if (*ref == '\n') {
++            newline_flag = TRUE;
++            newline_counter++;
++        }
++        if(valid_ff_flag)
++            ++ref;
++        if(newline_counter == 2) {
++            res = TEE_SUCCESS;                           
++            break; 
++        }                     
++    }
++    if(TEE_SUCCESS == res)
++        *ref='\0';
++
++    return res;
++}
++
++uint8_t modem_get_char(void)
++{
++    uint8_t dummy_ff_flag;
++
++    uart3_base = (vaddr_t)phys_to_virt(SUNXI_A64_UART3_BASE, MEM_AREA_IO_NSEC);
++    return modem_ops_st.getc(uart3_base,&dummy_ff_flag);
++}
++
++void modem_clear_ip_buffer(void) {
++    uint8_t tmp;
++    int8_t *ref = &tmp;
++    /*  we mainly use this for at command responses, so there are no hex bytes, we can ignore the 
++        check for 0xff */
++    uint8_t dummy_ff_flag; 
++
++    while((*ref = modem_ops_st.getc(uart3_base,&dummy_ff_flag)) != -1);
++}
++
++void append_atsendex_cmnd(uint8_t *hex_str) {
++    uint8_t cmnd[] = {'A','T','+','Q','I','S','E','N','D','E','X','=','1','1',','};
++    memcpy(hex_str, cmnd, QI_SENDEX_CMD_LEN);
++}
++
++void append_send_cmd(uint8_t *hex_str, uint32_t data_len) {
++    uint8_t cmnd[] = {'A','T','+','Q','I','S','E','N','D','=','1','1',','};
++    uint8_t at_len_data[5]={0};
++    memcpy(hex_str,cmnd,QI_SEND_CMD_LEN);
++
++    at_len_data[0] = (uint8_t)((data_len) / 100) + 48;
++    at_len_data[1] = (uint8_t)((data_len % 100) / 10) + 48;
++    at_len_data[2] = (uint8_t)((data_len % 100) % 10) + 48;  
++    at_len_data[3] = '\r';
++    at_len_data[4] = '\0';
++    memcpy(&hex_str[QI_SEND_CMD_LEN],at_len_data,sizeof(at_len_data));
++}
++
++void append_recv_cmd(uint8_t *hex_str, uint32_t num_bytes, uint8_t digs) {
++    uint8_t cmnd[] = {'A','T','+','Q','I','R','D','=','1','1',','};
++    uint8_t at_dynamic_data[6] = {0};
++    memcpy(hex_str,cmnd,sizeof(cmnd));
++
++
++    if(digs == 3) {
++        at_dynamic_data[0] = (uint8_t)((num_bytes) / 100) + 48;
++        at_dynamic_data[1] = (uint8_t)((num_bytes % 100) / 10) + 48;
++        at_dynamic_data[2] = (uint8_t)((num_bytes % 100) % 10) + 48;  
++        at_dynamic_data[3] = '\r';
++        at_dynamic_data[4] = '\0';
++        memcpy(&hex_str[sizeof(cmnd)],at_dynamic_data,5);
++    }
++    else if(digs == 4) {
++        at_dynamic_data[0] = (uint8_t)((num_bytes) / 1000) + 48;
++        at_dynamic_data[1] = (uint8_t)((num_bytes % 1000) / 100) + 48;
++        at_dynamic_data[2] = (uint8_t)(((num_bytes % 1000) % 100) / 10) + 48;
++        at_dynamic_data[3] = (uint8_t)(((num_bytes % 1000) % 100) % 10) + 48;
++        at_dynamic_data[4] = '\r';
++        at_dynamic_data[5] = '\0';
++        memcpy(&hex_str[sizeof(cmnd)],at_dynamic_data,6);        
++    }
++    else {
++        EMSG("Unsupported number of digits while building recv response command\n");
++    }
++}
++
++// Unused -- Cleanup
++void hex_byte_arr_to_str(uint8_t *hex_arr, uint32_t arr_size, uint8_t *hex_str, bool modem_flag)
++{
++    uint8_t *p_in = hex_arr;
++    int8_t *p_out = hex_str;
++    const int8_t *hex = "0123456789ABCDEF";
++
++    if(modem_flag) {
++        p_out[0]='"';
++        p_out++;
++    }
++    for(; p_in < hex_arr + arr_size; p_out+=2, p_in++) {
++        p_out[0] = hex[(*p_in>>4) & 0xF];
++        p_out[1] = hex[*p_in & 0xF];
++    }
++    if(modem_flag) {    
++        p_out++;
++        p_out[-1] = '"';
++        p_out++;
++        p_out[-1] = '\r';
++    }        
++    p_out++;
++    p_out[-1] = '\0';
++}
++
++void at_cmd_input(uint8_t *cmnd, modem_ctrl *m_st) {
++        modem_clear_ip_buffer();
++        modem_send_data(cmnd);
++        m_st->send_flg = FALSE;
++}
++
++TEE_Result at_recv_check(uint8_t *buf, uint8_t *res, modem_ctrl *m_st, modem_state next_state, uint16_t buf_clear_len)
++{   
++    //  Get response from modem
++    TEE_Result recv_res = modem_recv_data(buf);
++
++    //  Check if its standard error. Ask caller to resend at command by setting send_flag
++    if((TEE_SUCCESS == recv_res)  && strstr(buf,"ERROR") != NULL) {
++        EMSG("Error in state %d",m_st->m_state);
++        m_st->send_flg = TRUE;
++        memset(buf, 0x00, buf_clear_len);  
++        return TEE_ERROR_COMMUNICATION;
++    }
++    //  Check if response from modem is the expected message, if so, change the modem state variable to the given state
++    if((TEE_SUCCESS == recv_res) && (strstr(buf,res) != NULL)) {
++        m_st->m_state = next_state;
++        m_st->send_flg = TRUE;
++        IMSG("%s",buf);
++        memset(buf, 0x00, buf_clear_len);     
++        return TEE_SUCCESS;                
++    }
++
++    //  return generic error and maintain send_flag status to inform caller to re-read the buffer later
++    return TEE_ERROR_GENERIC;
++}
++
++TEE_Result read_recv_data(uint8_t *s, uint32_t read_len)
++{
++    uart3_base = (vaddr_t)phys_to_virt(SUNXI_A64_UART3_BASE, MEM_AREA_IO_NSEC);
++    TEE_Result res = TEE_ERROR_GENERIC;
++    uint8_t qird_resp_bytes, dummy_char;
++    uint32_t idx=0, brk_ctr = 0;
++    int8_t *ref;
++    uint8_t byte_validity_flag = 0; 
++    ref = &dummy_char;
++    /*  reuse variables to find num of digits in the qird resp msg to offset actual number of bytes to be read.
++        brk_ctr is used to count num of digits */
++    idx = read_len;
++    do
++    {
++        idx /= 10;
++        ++brk_ctr;
++    } while (idx != 0);
++    qird_resp_bytes = QIRD_READ_RESP_DEF_BYTES_SIZE +  brk_ctr;
++    // reset counters
++    brk_ctr = 0;
++    // the qird response is /n/r+QIRD:<read_len>/r/n<data>
++    for(idx = 0; idx<(read_len+qird_resp_bytes); brk_ctr++) {
++        *ref = modem_ops_st.getc(uart3_base,&byte_validity_flag);
++        // check if we actually read a valid byte from the UART FIFO, we use the pointer argument instead of ref now       
++        if(byte_validity_flag) {
++            // increment counter of num of bytes read
++            ++idx;
++            // if we have read
++            if(idx > qird_resp_bytes)
++                ++ref;
++        }
++
++        if(idx == qird_resp_bytes)
++            ref = s;
++        else if (idx == (read_len+qird_resp_bytes)) {
++            res = TEE_SUCCESS;  
++            break;
++        }
++
++        // incase caller sent wrong read_len and return error to caller
++        //if(brk_ctr == (4*(read_len+qird_resp_bytes)))
++            //break;       
++    }
++
++    return res;
++}
++
++TEE_Result read_recv_data2(uint8_t *s, uint32_t read_len)
++{
++    uart3_base = (vaddr_t)phys_to_virt(SUNXI_A64_UART3_BASE, MEM_AREA_IO_NSEC);
++    TEE_Result res = TEE_ERROR_GENERIC;
++    uint8_t dummy_char;
++    uint32_t idx=0, brk_ctr = 0;
++    int8_t *ref;
++    uint8_t byte_validity_flag = 0; 
++    ref = &dummy_char;
++
++    // the qird response is /n/r+QGPSLOC: /r/n>
++    for(idx = 0; idx<(read_len+QGPS_RESP_DEF_BYTES_SIZE); brk_ctr++) {
++        *ref = modem_ops_st.getc(uart3_base,&byte_validity_flag);
++        // check if we actually read a valid byte from the UART FIFO, we use the pointer argument instead of ref now       
++        if(byte_validity_flag) {
++            // increment counter of num of bytes read
++            ++idx;
++            // if we have read
++            if(idx > QGPS_RESP_DEF_BYTES_SIZE)
++                ++ref;
++        }
++
++        if(idx == QGPS_RESP_DEF_BYTES_SIZE)
++            ref = s;
++        else if (idx == (read_len+QGPS_RESP_DEF_BYTES_SIZE)) {
++            res = TEE_SUCCESS;  
++            break;
++        }
++
++        *ref = '\0';
++        if (strstr(s,"ERROR")!=NULL) {
++            EMSG("Error in GPS Fetch");
++            break;
++        }
++
++        // incase caller sent wrong read_len and return error to caller
++        //if(brk_ctr == (4*(read_len+qird_resp_bytes)))
++            //break;       
++    }
++
++    return res;
++}
++
++// Unused -- Cleanup
++TEE_Result read_till_string(uint8_t *s, uint8_t *ip, uint8_t ip_len) {
++    TEE_Result res = TEE_ERROR_GENERIC;
++    uint8_t ctr = 0;
++    int8_t *sref, *ipref;
++    sref = s;
++    ipref = ip;
++    /*  we mainly use this for at command responses, so there are no hex bytes, we can ignore the 
++        check for 0xff */
++    uint8_t dummy_ff_flag;
++
++    while((*sref = modem_ops_st.getc(uart3_base,&dummy_ff_flag)) != -1) {
++        if (*sref == *ipref) {
++            ipref++;
++            ctr++;
++        }
++        if(ctr == ip_len) {
++            res = TEE_SUCCESS;
++            break;
++        }
++        sref++;
++        
++        *sref = '\0';
++        if((strstr(s,"ERROR")!=NULL)) {
++            EMSG("Error in GPS Fetch");
++            break;
++        }
++    }
++    sref++;
++    *sref = '\0';
++
++    return res;
++}
++
++uint32_t get_qird_data_len(uint8_t *qird_resp, uint8_t *num_digs) {
++    uint8_t idx = 0, i = 0, comma_pos = 0, digs = 0;
++    uint16_t mulval[] = {1,10,100,1000};
++    int8_t *ref;
++    uint32_t res = 0;
++    ref = qird_resp;
++
++    if(strstr(qird_resp,"ERROR") != NULL) {
++        return res;
++    }
++    
++    while(i<2){
++        if(*ref == '\n')
++            i++;
++        if(*ref == ',')
++            comma_pos = idx;
++        idx++;
++        *ref++;
++    }
++    digs = idx-comma_pos-3;
++    for(i=digs;i>0;i--)
++        res += ((qird_resp[idx-2-i]-48) * mulval[i-1]) ;
++
++    *num_digs = digs;
++    return res;
++}
++
++TEE_Result get_imei_data(uint8_t *buf, uint8_t *imei_buf, modem_ctrl *m_st, modem_state next_state) {
++
++    TEE_Result recv_res = modem_recv_data(buf);
++    uint8_t idx = 0;
++    int8_t *ref_str;
++    ref_str = buf;
++
++    if(strstr(buf,"ERROR") != NULL) {
++        EMSG("Error Fetching IMEI Date");
++        m_st->send_flg = TRUE;
++        return TEE_ERROR_COMMUNICATION;
++    }
++    else {
++        // skip the /n/r in the received data
++        ref_str += 2;
++        // the first byte would be from only one character since imei is 15 digits
++        imei_buf[idx] = ((*ref_str)) & 0x0F;
++        ref_str++;
++        for (idx=1; idx<IMEI_DATA_SIZE; idx++, ref_str++) {
++            imei_buf[idx] = ((*ref_str) & 0x0F) << 4;
++            ref_str++;
++            imei_buf[idx] |= ((*ref_str)) & 0x0F;
++        }
++        m_st->m_state = next_state;
++        m_st->send_flg = TRUE;
++        memset(buf, 0x00, SUNXI_UART3_FIFO_EX_SIZE); 
++    }
++}
++
++static uint32_t atoii(uint8_t *s, uint8_t digs) {
++    uint32_t res = 0;
++    
++    for(uint8_t i = 0; i < digs; i++) {
++        res = res * 10 + ((s[i] - 48) & 0x0F);
++    }
++        
++    return res;
++}
++
++TEE_Result get_gps_data(uint8_t *s, cord_st *c_tst) {
++
++    uint8_t local_str_for_testing[] = "+QGPSLOC: 125313.0,1234.5678N,12345.6789E,2.0,99.9,2,135.37,0.0,0.0,280222,05";
++
++#if(GPS_USE_TYPE == GPS_USE_HW)
++    read_recv_data2(s,55);
++    if (strstr(s,"+QGPSLOC")!= NULL) {
++        lat_lon_alt(s, &c_tst->lat, &c_tst->lon, &c_tst->alt);
++        memcpy(&local_str_for_testing[QGPS_RESP_DEF_BYTES_SIZE],s,55);
++        return TEE_SUCCESS;
++    }
++    else { 
++#else
++        {
++#endif
++        lat_lon_alt(local_str_for_testing, &c_tst->lat, &c_tst->lon, &c_tst->alt);
++        return TEE_ERROR_COMMUNICATION;
++    }
++}
++
++void lat_lon_alt(uint8_t *s, uint32_t *lat, uint32_t *lon, uint16_t *alt) {
++    uint8_t commapos[10] = {0};
++    uint8_t idx = 0, comma_idx = 0;
++    uint8_t *ref;
++    ref = s;
++    
++    uint32_t llat=0;
++    uint32_t llon=0;
++    uint16_t lalt=0;
++    
++    while(*ref != '\0') {
++        
++        if(*ref == ',') {
++            commapos[comma_idx] = idx;
++            comma_idx++;
++        }
++        if(comma_idx == 5)
++            break;
++        idx++;
++        ref++;
++    }
++    
++    // lat ddmm.mm(N/S)
++    *lat = atoii(&s[commapos[0]+1],2) * 1000000;
++    *lat += atoii(&s[commapos[0]+3],2) * 10000;
++    *lat += atoii(&s[commapos[0]+6],3) * 10;
++    if(s[commapos[0]+10] == 'N')
++        llat += 1;
++    else
++        llat += 0;
++        
++    // long dddmm.m(E/W)
++    *lon = atoii(&s[commapos[1]+1],3) * 100000;
++    *lon += atoii(&s[commapos[1]+4],2) * 1000;
++    *lon += atoii(&s[commapos[1]+7],2) * 10;
++    if(s[commapos[0]+10] == 'E')
++        llon += 1;
++    else
++        llon += 0;    
++    
++    // ignore decimal value
++    uint8_t digs_alt = commapos[4] - commapos[3] - 3;
++    for(uint8_t i = 0; i < digs_alt; i++)
++        *alt = *alt * 10 + (s[commapos[3]+(i+1)] - '0');
++}
++
+diff --git a/core/arch/arm/plat-sunxi/platform_config.h b/core/arch/arm/plat-sunxi/platform_config.h
+index 1c682cc3..d25318dc 100644
+--- a/core/arch/arm/plat-sunxi/platform_config.h
++++ b/core/arch/arm/plat-sunxi/platform_config.h
+@@ -38,7 +38,7 @@
+ 
+ /* 16550 UART */
+ #define CONSOLE_UART_BASE	0x01c28000 /* UART0 */
+-#define CONSOLE_UART_CLK_IN_HZ	24000000
++#define CONSOLE_UART_CLK_IN_HZ	50000000
+ #define CONSOLE_BAUDRATE	115200
+ #define SUNXI_UART_REG_SIZE	0x400
+ 
+@@ -57,6 +57,9 @@
+ 
+ #if defined(PLATFORM_FLAVOR_sun50i_a64)
+ #define SUNXI_SMC_BASE		0x01c1e000
++#define GIC_BASE            0x01C80000
++#define GICC_OFFSET		    0x2000
++#define GICD_OFFSET		    0x1000
+ #endif
+ 
+ #endif /* PLATFORM_CONFIG_H */
+diff --git a/core/arch/arm/plat-sunxi/sub.mk b/core/arch/arm/plat-sunxi/sub.mk
+index 6fefa627..33256743 100644
+--- a/core/arch/arm/plat-sunxi/sub.mk
++++ b/core/arch/arm/plat-sunxi/sub.mk
+@@ -1,4 +1,12 @@
+ global-incdirs-y += .
+ srcs-y += main.c
++srcs-y += cv2x.c
++srcs-y += dsrc.c
++srcs-y += modem.c
++srcs-y += cv2x_helpers.c
++srcs-y += uart_assm.S
+ srcs-$(CFG_ARM32_core) += plat_init.S
+ srcs-$(CFG_ARM32_core) += psci.c
++
++
++
+diff --git a/core/arch/arm/plat-sunxi/uart_assm.S b/core/arch/arm/plat-sunxi/uart_assm.S
+new file mode 100644
+index 00000000..bf5176ec
+--- /dev/null
++++ b/core/arch/arm/plat-sunxi/uart_assm.S
+@@ -0,0 +1,168 @@
++#include <asm.S>
++
++#include "uart_assm.h"
++
++    .globl uart_core_init
++    .globl uart_core_putc
++    .globl uart_core_getc
++    .globl uart_core_flush
++	.globl uart_int_en
++	.globl uart_int_di
++
++	/* -----------------------------------------------
++	 * int uart_core_init(uintptr_t base_addr,
++	 * unsigned int uart_clk, unsigned int baud_rate)
++	 * Function to initialize the console without a
++	 * C Runtime to print debug information.
++	 * In: x0 - console base address
++	 *     w1 - Uart clock in Hz
++	 *     w2 - Baud rate
++	 * Out: return 0 on success, 1 on error
++	 * Clobber list : x1, x2, x3
++	 * -----------------------------------------------
++	 */
++FUNC uart_core_init , :
++	/* Check the input base address */
++	cbz	x0, init_fail
++	/* Check baud rate and uart clock for sanity */
++	cbz	w1, init_fail
++	cbz	w2, init_fail
++
++	/* Program the baudrate */
++	/* Divisor =  Uart clock / (16 * baudrate) */
++	lsl	w2, w2, #4
++	udiv	w2, w1, w2
++	and	w1, w2, #0xff		/* w1 = DLL */
++	lsr	w2, w2, #8
++	and	w2, w2, #0xff		/* w2 = DLLM */
++	ldr	w3, [x0, #UARTLCR]
++	orr	w3, w3, #UARTLCR_DLAB
++	str	w3, [x0, #UARTLCR]	/* enable DLL, DLLM programming */
++	str	w1, [x0, #UARTDLL]	/* program DLL */
++	str	w2, [x0, #UARTDLLM]	/* program DLLM */
++	mov	w2, #~UARTLCR_DLAB
++	and	w3, w3, w2
++	str	w3, [x0, #UARTLCR]	/* disable DLL, DLLM programming */
++
++	/* 8n1 */
++	mov	w3, #3
++	str	w3, [x0, #UARTLCR]
++	/* no interrupt */
++	mov	w3, #0
++	str	w3, [x0, #UARTIER]
++	/* enable fifo, DMA */
++	mov	w3, #(UARTFCR_FIFOEN | UARTFCR_DMAEN)
++	str	w3, [x0, #UARTFCR]
++	mov	w0, #0
++	ret
++init_fail:
++	mov	w0, #1
++	ret
++END_FUNC uart_core_init
++
++	/* --------------------------------------------------------
++	 * int uart_core_putc(int c, uintptr_t base_addr, uint8_t *byt_validity)
++	 * Function to output a character over the console. It
++	 * returns the character printed on success or -1 on error.
++	 * In : w0 - character to be printed
++	 *      x1 - console base address
++	 * Out : return -1 on error else return character.
++	 * Clobber list : x2
++	 * --------------------------------------------------------
++	 */
++FUNC uart_core_putc , :
++	/* Prepend '\r' to '\n' */	
++	cmp	w0, #0xA
++	b.ne	2f
++	/* Check if the transmit FIFO is full */
++1:	ldr	w2, [x1, #UARTLSR]
++	and	w2, w3, #(UARTLSR_TEMT | UARTLSR_THRE)
++	cmp	w2, #(UARTLSR_TEMT | UARTLSR_THRE)
++	b.ne	1b
++	mov	w2, #0xD		/* '\r' */
++	str	w2, [x1, #UARTTX]
++
++	/* Check if the transmit FIFO is full */
++2:	ldr	w2, [x1, #UARTLSR]
++	and	w2, w2, #(UARTLSR_TEMT | UARTLSR_THRE)
++	cmp	w2, #(UARTLSR_TEMT | UARTLSR_THRE)
++	b.ne	2b
++	str	w0, [x1, #UARTTX]
++	ret
++END_FUNC uart_core_putc
++
++	/* ---------------------------------------------
++	 * int uart_core_getc(uintptr_t base_addr, uint8_t *byt_validity)
++	 * Function to get a character from the console.
++	 * It returns the character grabbed on success
++	 * or -1 on if no character is available.
++	 * In :  x0 - console base address
++	 * In :  x1 - getc valid (used in case of direct hex bytes transfer)
++	 * Out : w0 - character if available, else -1
++	 * Clobber list : x0, x1, x3
++	 * ---------------------------------------------
++	 */
++FUNC uart_core_getc , :
++	mov w3, #B_INVALID_HEX_CASE
++	strb w3, [x1]
++	/* Check if the receive FIFO is empty */
++1:	ldr	w2, [x0, #UARTLSR]
++	tbz	w2, #UARTLSR_RDR_BIT, no_char
++	mov w3, #B_VALID_HEX_CASE
++	str w3, [x1]	
++	ldr	w0, [x0, #UARTRX]
++	ret
++no_char:
++	mov	w0, #ERROR_NO_PENDING_CHAR
++	ret
++END_FUNC uart_core_getc
++
++	/* ---------------------------------------------
++	 * void uart_core_flush(uintptr_t base_addr)
++	 * Function to force a write of all buffered
++	 * data that hasn't been output.
++	 * In : x0 - console base address
++	 * Out : void.
++	 * Clobber list : x0, x1
++	 * ---------------------------------------------
++	 */
++FUNC uart_core_flush , :
++	/* Loop until the transmit FIFO is empty */
++1:	ldr	w1, [x0, #UARTLSR]
++	and	w1, w1, #(UARTLSR_TEMT | UARTLSR_THRE)
++	cmp	w1, #(UARTLSR_TEMT | UARTLSR_THRE)
++	b.ne	1b
++	ret
++END_FUNC uart_core_flush
++
++	/* ---------------------------------------------
++	 * void uart_rcv_data_int_enable(uintptr_t base_addr)
++	 * Function to enable received data available interrupt
++	 * In : x0 - console base address
++	 * Out : void.
++	 * Clobber list : x0, x1
++	 * ---------------------------------------------
++	 */
++FUNC uart_int_en , :
++	ldr w1, [x0, #UARTIER]
++	and w1, w1, #UART_IIER_ERBFI_CLEAR_MASK
++	orr w1, w1, #UART_IIER_ERBFI_SET
++	str w1, [x0, #UARTIER]
++	ret
++END_FUNC uart_int_en
++
++	/* ---------------------------------------------
++	 * void uart_rcv_data_int_disable(uintptr_t base_addr)
++	 * Function to disable received data available interrupt
++	 * In : x0 - console base address
++	 * Out : void.
++	 * Clobber list : x0, x1
++	 * ---------------------------------------------
++	 */
++FUNC uart_int_di , :
++	ldr w1, [x0, #UARTIER]
++	and w1, w1, #UART_IIER_ERBFI_CLEAR_MASK
++	str w1, [x0, #UARTIER]
++	ret
++END_FUNC uart_int_di
++
+diff --git a/core/arch/arm/plat-sunxi/uart_assm.h b/core/arch/arm/plat-sunxi/uart_assm.h
+new file mode 100644
+index 00000000..e2e755d3
+--- /dev/null
++++ b/core/arch/arm/plat-sunxi/uart_assm.h
+@@ -0,0 +1,73 @@
++#ifndef _UART_ASSM_H_
++#define _UART_ASSM_H_
++
++/* UART16550 Registers */
++#define UARTTX			0x0
++#define UARTRX			0x0
++#define UARTDLL			0x0
++#define UARTIER			0x4
++#define UARTDLLM		0x4
++#define UARTIIR			0x8
++#define UARTFCR			0x8
++#define UARTLCR			0xc
++#define UARTMCR			0x10
++#define UARTLSR			0x14
++#define UARTMSR			0x18
++#define UARTSPR			0x1c
++#define UARTCSR			0x20
++/* Some instances have MDR1 defined as well */
++#define UARTMDR1		0x20
++#define UARTRXFIFOCFG	0x24
++#define UARTMIE			0x28
++#define UARTVNDR		0x2c
++#define UARTASR			0x3c
++
++/* FIFO Control Register bits */
++#define UARTFCR_FIFOMD_16450	(0 << 6)
++#define UARTFCR_FIFOMD_16550	(1 << 6)
++#define UARTFCR_RXTRIG_1	    (0 << 6)
++#define UARTFCR_RXTRIG_4	    (1 << 6)
++#define UARTFCR_RXTRIG_8	    (2 << 6)
++#define UARTFCR_RXTRIG_16	    (3 << 6)
++#define UARTFCR_TXTRIG_1	    (0 << 4)
++#define UARTFCR_TXTRIG_4    	(1 << 4)
++#define UARTFCR_TXTRIG_8	    (2 << 4)
++#define UARTFCR_TXTRIG_16   	(3 << 4)
++#define UARTFCR_DMAEN		    (1 << 3)	/* Enable DMA mode */
++#define UARTFCR_TXCLR		    (1 << 2)	/* Clear contents of Tx FIFO */
++#define UARTFCR_RXCLR		    (1 << 1)	/* Clear contents of Rx FIFO */
++#define UARTFCR_FIFOEN		    (1 << 0)	/* Enable the Tx/Rx FIFO */
++
++/* Line Control Register bits */
++#define UARTLCR_DLAB		(1 << 7)	/* Divisor Latch Access */
++#define UARTLCR_SETB		(1 << 6)	/* Set BREAK Condition */
++#define UARTLCR_SETP		(1 << 5)	/* Set Parity to LCR[4] */
++#define UARTLCR_EVEN		(1 << 4)	/* Even Parity Format */
++#define UARTLCR_PAR		    (1 << 3)	/* Parity */
++#define UARTLCR_STOP		(1 << 2)	/* Stop Bit */
++#define UARTLCR_WORDSZ_5	0		/* Word Length of 5 */
++#define UARTLCR_WORDSZ_6	1		/* Word Length of 6 */
++#define UARTLCR_WORDSZ_7	2		/* Word Length of 7 */
++#define UARTLCR_WORDSZ_8	3		/* Word Length of 8 */
++
++/* Line Status Register bits */
++#define UARTLSR_RXFIFOEMT	(1 << 9)	/* Rx Fifo Empty */
++#define UARTLSR_TXFIFOFULL	(1 << 8)	/* Tx Fifo Full */
++#define UARTLSR_RXFIFOERR	(1 << 7)	/* Rx Fifo Error */
++#define UARTLSR_TEMT		(1 << 6)	/* Tx Shift Register Empty */
++#define UARTLSR_THRE		(1 << 5)	/* Tx Holding Register Empty */
++#define UARTLSR_BRK		    (1 << 4)	/* Break Condition Detected */
++#define UARTLSR_FERR		(1 << 3)	/* Framing Error */
++#define UARTLSR_PERR		(1 << 3)	/* Parity Error */
++#define UARTLSR_OVRF		(1 << 2)	/* Rx Overrun Error */
++#define UARTLSR_RDR_BIT		(0)		/* Rx Data Ready Bit */
++#define UARTLSR_RDR		    (1 << UARTLSR_RDR_BIT)	/* Rx Data Ready */
++
++#define ERROR_NO_PENDING_CHAR       -1
++#define B_VALID_HEX_CASE             1
++#define B_INVALID_HEX_CASE           0
++
++#define UART_IIER_ERBFI_CLEAR_MASK             0xFFFFFFFE
++#define UART_IIER_ERBFI_SET                    1              
++
++#endif /* _UART_ASSM_H */
+\ No newline at end of file
+diff --git a/core/arch/arm/tee/arch_svc.c b/core/arch/arm/tee/arch_svc.c
+index 6aff8022..cf749d28 100644
+--- a/core/arch/arm/tee/arch_svc.c
++++ b/core/arch/arm/tee/arch_svc.c
+@@ -121,6 +121,7 @@ static const struct syscall_entry tee_svc_syscall_table[] = {
+ 	SYSCALL_ENTRY(syscall_not_supported),
+ 	SYSCALL_ENTRY(syscall_not_supported),
+ 	SYSCALL_ENTRY(syscall_cache_operation),
++	SYSCALL_ENTRY(syscall_runtime_driver_ops),
+ };
+ 
+ /*
+diff --git a/core/crypto.mk b/core/crypto.mk
+index b2f19499..697431ea 100644
+--- a/core/crypto.mk
++++ b/core/crypto.mk
+@@ -32,6 +32,7 @@ CFG_CRYPTO_SHA384 ?= y
+ CFG_CRYPTO_SHA512 ?= y
+ CFG_CRYPTO_SHA512_256 ?= y
+ CFG_CRYPTO_SM3 ?= y
++CFG_CRYPTO_ASCONHASHA ?= y
+ 
+ # Asymmetric ciphers
+ CFG_CRYPTO_DSA ?= y
+diff --git a/core/crypto/ascon-hasha-hmac.c b/core/crypto/ascon-hasha-hmac.c
+new file mode 100644
+index 00000000..346a3b1f
+--- /dev/null
++++ b/core/crypto/ascon-hasha-hmac.c
+@@ -0,0 +1,114 @@
++
++#include <assert.h>
++#include <compiler.h>
++#include <crypto/crypto.h>
++#include <crypto/crypto_impl.h>
++#include <stdlib.h>
++#include <string_ext.h>
++#include <string.h>
++#include <tee_api_types.h>
++#include <utee_defines.h>
++#include <util.h>
++#include <crypto/ascon.h>
++
++struct asconhasha_hmac_ctx {
++    struct crypto_mac_ctx mac_ctx;
++    struct asconhasha_ctx hasha_ctx;
++};
++
++static const struct crypto_mac_ops hasha_mac_ops;
++
++static struct asconhasha_hmac_ctx *to_hmac_ctx(struct crypto_mac_ctx *ctx)
++{
++	assert(ctx && ctx->ops == &hasha_mac_ops);
++
++	return container_of(ctx, struct asconhasha_hmac_ctx, mac_ctx);
++}
++
++static TEE_Result op_asconhasha_hmac_init(struct crypto_mac_ctx *ctx,
++				 			const uint8_t *key, size_t len)
++{
++	asconhasha_hmac_init(&to_hmac_ctx(ctx)->hasha_ctx, key, len);
++
++	return TEE_SUCCESS;
++}
++
++static TEE_Result op_asconhasha_hmac_update(struct crypto_mac_ctx *ctx,
++				     const uint8_t *data, size_t len)
++{
++	asconhasha_hmac_update(&to_hmac_ctx(ctx)->hasha_ctx, data, len);
++
++	return TEE_SUCCESS;
++}
++
++static TEE_Result op_asconhasha_hmac_final(struct crypto_mac_ctx *ctx,
++				    uint8_t *digest,
++				    size_t len)
++{
++	struct asconhasha_hmac_ctx *hc = to_hmac_ctx(ctx);
++	size_t hash_size = TEE_ASCONHASHA_HASH_SIZE;
++	uint8_t block_digest[TEE_ASCONHASHA_HASH_SIZE] = { 0 };
++	uint8_t *tmp_digest = NULL;
++
++	if (len == 0)
++		return TEE_ERROR_BAD_PARAMETERS;
++
++	if (hash_size > len)
++		tmp_digest = block_digest; /* use a tempory buffer */
++	else
++		tmp_digest = digest;
++
++	asconhasha_final(&hc->hasha_ctx, tmp_digest,len);
++
++	if (hash_size > len)
++		memcpy(digest, tmp_digest, len);
++
++	memzero_explicit(block_digest, sizeof(block_digest));
++
++	return TEE_SUCCESS;
++}
++
++static void op_asconhasha_hmac_free_ctx(struct crypto_mac_ctx *ctx)
++{
++	struct asconhasha_hmac_ctx *hc = to_hmac_ctx(ctx);
++
++	memzero_explicit(&hc->hasha_ctx, sizeof(hc->hasha_ctx));
++	free(hc);
++}
++
++static void op_asconhasha_hmac_copy_state(struct crypto_mac_ctx *dst_ctx,
++				   struct crypto_mac_ctx *src_ctx)
++{
++	struct asconhasha_hmac_ctx *src = to_hmac_ctx(src_ctx);
++	struct asconhasha_hmac_ctx *dst = to_hmac_ctx(dst_ctx);
++
++	dst->hasha_ctx = src->hasha_ctx;
++}
++
++static const struct crypto_mac_ops hasha_mac_ops = {
++	.init = op_asconhasha_hmac_init,
++	.update = op_asconhasha_hmac_update,
++	.final = op_asconhasha_hmac_final,
++	.free_ctx = op_asconhasha_hmac_free_ctx,
++	.copy_state = op_asconhasha_hmac_copy_state,
++};
++
++TEE_Result crypto_hmac_asconhasha_alloc_ctx(struct crypto_mac_ctx **ctx)
++{
++	struct asconhasha_hmac_ctx *hc = NULL;
++
++	hc = calloc(1, sizeof(*hc));
++	if (!hc)
++		return TEE_ERROR_OUT_OF_MEMORY;
++
++	hc->mac_ctx.ops = &hasha_mac_ops;
++
++	*ctx = &hc->mac_ctx;
++
++	return TEE_SUCCESS;
++}
++
++
++
++
++
+diff --git a/core/crypto/ascon-hasha.c b/core/crypto/ascon-hasha.c
+new file mode 100644
+index 00000000..197958fa
+--- /dev/null
++++ b/core/crypto/ascon-hasha.c
+@@ -0,0 +1,111 @@
++
++#include <assert.h>
++#include <compiler.h>
++#include <crypto/crypto.h>
++#include <crypto/crypto_impl.h>
++#include <stdlib.h>
++#include <string_ext.h>
++#include <string.h>
++#include <tee_api_types.h>
++#include <utee_defines.h>
++#include <util.h>
++#include <crypto/ascon.h>
++
++struct asconhasha_hash_ctx {
++    struct crypto_hash_ctx hash_ctx;
++    struct asconhasha_ctx hasha_ctx;
++};
++
++static const struct crypto_hash_ops hasha_hash_ops;
++
++static struct asconhasha_hash_ctx *to_hash_ctx(struct crypto_hash_ctx *ctx)
++{
++	assert(ctx && ctx->ops == &hasha_hash_ops);
++
++	return container_of(ctx, struct asconhasha_hash_ctx, hash_ctx);
++}
++
++static TEE_Result op_asconhasha_hash_init(struct crypto_hash_ctx *ctx)
++{
++	asconhasha_init(&to_hash_ctx(ctx)->hasha_ctx);
++
++	return TEE_SUCCESS;
++}
++
++static TEE_Result op_asconhasha_hash_update(struct crypto_hash_ctx *ctx,
++				     const uint8_t *data, size_t len)
++{
++	asconhasha_update(&to_hash_ctx(ctx)->hasha_ctx, data, len);
++
++	return TEE_SUCCESS;
++}
++
++static TEE_Result op_asconhasha_hash_final(struct crypto_hash_ctx *ctx,
++				    uint8_t *digest,
++				    size_t len)
++{
++	struct asconhasha_hash_ctx *hc = to_hash_ctx(ctx);
++	size_t hash_size = TEE_ASCONHASHA_HASH_SIZE;
++	uint8_t block_digest[TEE_ASCONHASHA_HASH_SIZE] = { 0 };
++	uint8_t *tmp_digest = NULL;
++
++	if (len == 0)
++		return TEE_ERROR_BAD_PARAMETERS;
++
++	if (hash_size > len)
++		tmp_digest = block_digest; /* use a tempory buffer */
++	else
++		tmp_digest = digest;
++
++	asconhasha_final(&hc->hasha_ctx, tmp_digest,len);
++
++	if (hash_size > len)
++		memcpy(digest, tmp_digest, len);
++
++	return TEE_SUCCESS;
++}
++
++static void op_asconhasha_hash_free_ctx(struct crypto_hash_ctx *ctx)
++{
++	struct asconhasha_hash_ctx *hc = to_hash_ctx(ctx);
++
++	memzero_explicit(&hc->hasha_ctx, sizeof(hc->hasha_ctx));
++	free(hc);
++}
++
++static void op_asconhasha_hash_copy_state(struct crypto_hash_ctx *dst_ctx,
++				   struct crypto_hash_ctx *src_ctx)
++{
++	struct asconhasha_hash_ctx *src = to_hash_ctx(src_ctx);
++	struct asconhasha_hash_ctx *dst = to_hash_ctx(dst_ctx);
++
++	dst->hasha_ctx = src->hasha_ctx;
++}
++
++static const struct crypto_hash_ops hasha_hash_ops = {
++	.init = op_asconhasha_hash_init,
++	.update = op_asconhasha_hash_update,
++	.final = op_asconhasha_hash_final,
++	.free_ctx = op_asconhasha_hash_free_ctx,
++	.copy_state = op_asconhasha_hash_copy_state,
++};
++
++TEE_Result crypto_asconhasha_alloc_ctx(struct crypto_hash_ctx **ctx)
++{
++	struct asconhasha_hash_ctx *hc = NULL;
++
++	hc = calloc(1, sizeof(*hc));
++	if (!hc)
++		return TEE_ERROR_OUT_OF_MEMORY;
++
++	hc->hash_ctx.ops = &hasha_hash_ops;
++
++	*ctx = &hc->hash_ctx;
++
++	return TEE_SUCCESS;
++}
++
++
++
++
++
+diff --git a/core/crypto/ascon.c b/core/crypto/ascon.c
+new file mode 100644
+index 00000000..af922f47
+--- /dev/null
++++ b/core/crypto/ascon.c
+@@ -0,0 +1,134 @@
++#include <crypto/ascon.h>
++#include <crypto/ascon_permutations.h>
++
++#include <string.h>
++#include <string_ext.h>
++
++
++#if !ASCON_INLINE_MODE
++#undef forceinline
++#define forceinline
++#endif
++
++forceinline void asconhasha_init(struct asconhasha_ctx *ctx) {
++  /* initialize */
++#if ASCON_HASH_OUTLEN == 32 && ASCON_HASH_ROUNDS == 12
++  ctx.s->x0 = ASCON_HASH_IV0;
++  ctx->s.x1 = ASCON_HASH_IV1;
++  ctx->s.x1= ASCON_HASH_IV2;
++  ctx->s.x1 = ASCON_HASH_IV3;
++  ctx->s.x1 = ASCON_HASH_IV4;
++#elif ASCON_HASH_OUTLEN == 32 && ASCON_HASH_ROUNDS == 8
++  ctx->s.x0 = ASCON_HASHA_IV0;
++  ctx->s.x1 = ASCON_HASHA_IV1;
++  ctx->s.x2 = ASCON_HASHA_IV2;
++  ctx->s.x3 = ASCON_HASHA_IV3;
++  ctx->s.x4 = ASCON_HASHA_IV4;
++#elif ASCON_HASH_OUTLEN == 0 && ASCON_HASH_ROUNDS == 12
++  s->x0 = ASCON_XOF_IV0;
++  s->x1 = ASCON_XOF_IV1;
++  s->x2 = ASCON_XOF_IV2;
++  s->x3 = ASCON_XOF_IV3;
++  s->x4 = ASCON_XOF_IV4;
++#elif ASCON_HASH_OUTLEN == 0 && ASCON_HASH_ROUNDS == 8
++  s->x0 = ASCON_XOFA_IV0;
++  s->x1 = ASCON_XOFA_IV1;
++  s->x2 = ASCON_XOFA_IV2;
++  s->x3 = ASCON_XOFA_IV3;
++  s->x4 = ASCON_XOFA_IV4;
++#endif
++}
++
++forceinline void asconhasha_update(struct asconhasha_ctx *ctx, const uint8_t* in, uint64_t inlen) {
++  /* absorb full plaintext blocks */
++  while (inlen >= ASCON_HASH_RATE) {
++    ctx->s.x0 = XOR(ctx->s.x0, LOAD(in, 8));
++    P((state_t *)&ctx->s, ASCON_HASH_ROUNDS);
++    in += ASCON_HASH_RATE;
++    inlen -= ASCON_HASH_RATE;
++  }
++  /* absorb final plaintext block */
++  if (inlen) ctx->s.x0 = XOR(ctx->s.x0, LOAD(in, inlen));
++  ctx->s.x0 = XOR(ctx->s.x0, PAD(inlen));
++  P((state_t *)&ctx->s, 12);
++}
++
++forceinline void asconhasha_final(struct asconhasha_ctx *ctx, uint8_t* out, uint64_t outlen) {
++  /* squeeze full output blocks */
++  while (outlen > ASCON_HASH_RATE) {
++    STORE(out, ctx->s.x0, 8);
++    P((state_t *)&ctx->s, ASCON_HASH_ROUNDS);
++    out += ASCON_HASH_RATE;
++    outlen -= ASCON_HASH_RATE;
++  }
++  /* squeeze final output block */
++  STORE(out, ctx->s.x0, outlen);
++}
++
++
++void ascon_hasha(unsigned char* out, const unsigned char* in,
++                unsigned long long inlen) {
++  struct asconhasha_ctx ctx = {};
++
++  asconhasha_init(&ctx);
++  asconhasha_update(&ctx, in, inlen);
++  asconhasha_final(&ctx, out, CRYPTO_BYTES);
++  
++  memzero_explicit(&ctx, sizeof(ctx));
++}
++
++void asconhasha_hmac_init(struct asconhasha_ctx *ctx,const uint8_t *key, size_t keylen)
++{
++	size_t i;
++	uint8_t sum[32];
++
++	if (keylen > 64) {
++		ascon_hasha(sum, key, keylen);
++		keylen = 32;
++		key = sum;
++	}
++
++	memset(ctx->ipad, 0x36, 64);
++	memset(ctx->opad, 0x5C, 64);
++
++	for (i = 0; i < keylen; i++) {
++		ctx->ipad[i] ^= key[i];
++		ctx->opad[i] ^= key[i];
++	}
++
++	asconhasha_init(ctx);
++	asconhasha_update(ctx, ctx->ipad, 64);
++
++	memzero_explicit(sum, sizeof(sum));
++}
++
++void asconhasha_hmac_update(struct asconhasha_ctx *ctx, const uint8_t *input, size_t ilen)
++{
++	asconhasha_update(ctx, input, ilen);
++}
++
++void asconhasha_hmac_final(struct asconhasha_ctx *ctx, uint8_t* out, uint64_t outlen)
++{
++	uint8_t tmpbuf[32];
++
++	asconhasha_final(ctx, tmpbuf, CRYPTO_BYTES);
++	asconhasha_init(ctx);
++	asconhasha_update(ctx,(uint8_t *)&ctx->opad, 64);
++	asconhasha_update(ctx, tmpbuf, 32);
++	asconhasha_final(ctx, out, outlen);
++
++	memzero_explicit(tmpbuf, sizeof(tmpbuf));
++}
++
++/*
++void main()
++{
++  uint8_t a = 0x00;
++  uint8_t out[32] = {0};
++
++  ascon_hasha(out, &a, 1);
++
++  for(uint8_t i=0;i<32;i++)
++    printf("%02x ",out[i]);
++  printf("\n");
++} */  
+diff --git a/core/crypto/ascon_permutations.c b/core/crypto/ascon_permutations.c
+new file mode 100644
+index 00000000..3da82b56
+--- /dev/null
++++ b/core/crypto/ascon_permutations.c
+@@ -0,0 +1,15 @@
++#include <crypto/ascon_permutations.h>
++
++#if !ASCON_INLINE_PERM && ASCON_UNROLL_LOOPS
++
++void P12(state_t* s) { P12ROUNDS(s); }
++void P8(state_t* s) { P8ROUNDS(s); }
++void P6(state_t* s) { P6ROUNDS(s); }
++
++#endif
++
++#if !ASCON_INLINE_PERM && !ASCON_UNROLL_LOOPS
++
++void P(state_t* s, int nr) { PROUNDS(s, nr); }
++
++#endif
+diff --git a/core/crypto/crypto.c b/core/crypto/crypto.c
+index 3037e1e6..8f46044c 100644
+--- a/core/crypto/crypto.c
++++ b/core/crypto/crypto.c
+@@ -48,6 +48,9 @@ TEE_Result crypto_hash_alloc_ctx(void **ctx, uint32_t algo)
+ 		case TEE_ALG_SM3:
+ 			res = crypto_sm3_alloc_ctx(&c);
+ 			break;
++		case TEE_ALG_ASCONHASHA:
++			res = crypto_asconhasha_alloc_ctx(&c);
++			break;			
+ 		default:
+ 			break;
+ 		}
+@@ -256,6 +259,9 @@ TEE_Result crypto_mac_alloc_ctx(void **ctx, uint32_t algo)
+ 		case TEE_ALG_HMAC_SM3:
+ 			res = crypto_hmac_sm3_alloc_ctx(&c);
+ 			break;
++		case TEE_ALG_HMAC_ASCONHASHA:
++			res = crypto_hmac_asconhasha_alloc_ctx(&c);
++			break;			
+ 		case TEE_ALG_AES_CBC_MAC_NOPAD:
+ 			res = crypto_aes_cbc_mac_nopad_alloc_ctx(&c);
+ 			break;
+diff --git a/core/crypto/sub.mk b/core/crypto/sub.mk
+index 873ef986..dba60d51 100644
+--- a/core/crypto/sub.mk
++++ b/core/crypto/sub.mk
+@@ -36,3 +36,9 @@ srcs-$(CFG_CRYPTO_ECB) += sm4-ecb.c
+ srcs-$(CFG_CRYPTO_CBC) += sm4-cbc.c
+ srcs-$(CFG_CRYPTO_CTR) += sm4-ctr.c
+ endif
++ifeq ($(CFG_CRYPTO_ASCONHASHA),y)
++srcs-y += ascon-hasha.c
++srcs-y += ascon.c
++srcs-y += ascon_permutations.c
++srcs-$(CFG_CRYPTO_HMAC) += ascon-hasha-hmac.c
++endif
+diff --git a/core/drivers/gic.c b/core/drivers/gic.c
+index 7052a4a1..a7ff7c3c 100644
+--- a/core/drivers/gic.c
++++ b/core/drivers/gic.c
+@@ -71,6 +71,7 @@
+ #define GICC_IAR_CPU_ID_SHIFT	10
+ 
+ static void gic_op_add(struct itr_chip *chip, size_t it, uint32_t flags);
++static void gic_op_add_cpumask(struct itr_chip *chip, size_t it, uint32_t flags, uint32_t cpu_mask);
+ static void gic_op_enable(struct itr_chip *chip, size_t it);
+ static void gic_op_disable(struct itr_chip *chip, size_t it);
+ static void gic_op_raise_pi(struct itr_chip *chip, size_t it);
+@@ -81,6 +82,7 @@ static void gic_op_set_affinity(struct itr_chip *chip, size_t it,
+ 
+ static const struct itr_ops gic_ops = {
+ 	.add = gic_op_add,
++	.add_cpumask = gic_op_add_cpumask,
+ 	.enable = gic_op_enable,
+ 	.disable = gic_op_disable,
+ 	.raise_pi = gic_op_raise_pi,
+@@ -434,13 +436,27 @@ static void gic_op_add(struct itr_chip *chip, size_t it,
+ 
+ 	if (it > gd->max_it)
+ 		panic();
+-
++		
+ 	gic_it_add(gd, it);
+ 	/* Set the CPU mask to deliver interrupts to any online core */
+ 	gic_it_set_cpu_mask(gd, it, 0xff);
+ 	gic_it_set_prio(gd, it, 0x1);
+ }
+ 
++static void gic_op_add_cpumask(struct itr_chip *chip, size_t it,
++		       uint32_t flags __unused, uint32_t cpu_mask)
++{
++	struct gic_data *gd = container_of(chip, struct gic_data, chip);
++
++	if (it > gd->max_it)
++		panic();
++		
++	gic_it_add(gd, it);
++	/* Set the CPU mask to deliver interrupts to designated cores */
++	gic_it_set_cpu_mask(gd, it, cpu_mask);
++	gic_it_set_prio(gd, it, 0x1);
++}
++
+ static void gic_op_enable(struct itr_chip *chip, size_t it)
+ {
+ 	struct gic_data *gd = container_of(chip, struct gic_data, chip);
+diff --git a/core/include/crypto/ascon.h b/core/include/crypto/ascon.h
+new file mode 100644
+index 00000000..ca040d13
+--- /dev/null
++++ b/core/include/crypto/ascon.h
+@@ -0,0 +1,52 @@
++#ifndef ASCON_H_
++#define ASCON_H_
++
++#include <stdint.h>
++#include <stddef.h>
++
++#include "ascon_word.h"
++
++/* ------------------------CONFIG-------------------------- */
++/* inline the ascon mode */
++#ifndef ASCON_INLINE_MODE
++#define ASCON_INLINE_MODE 1
++#endif
++
++/* inline all permutations */
++#ifndef ASCON_INLINE_PERM
++#define ASCON_INLINE_PERM 1
++#endif
++
++/* unroll permutation loops */
++#ifndef ASCON_UNROLL_LOOPS
++#define ASCON_UNROLL_LOOPS 1
++#endif
++/* -------------------------------------------------------- */
++
++
++/* -------------------------API---------------------------- */
++#define CRYPTO_VERSION "1.2.5"
++#define CRYPTO_BYTES 32
++#define ASCON_HASH_OUTLEN 32 /* HASH */
++#define ASCON_HASH_ROUNDS 8
++/* -------------------------------------------------------- */
++
++typedef struct {
++  word_t x0, x1, x2, x3, x4;
++} state_t;
++
++struct asconhasha_ctx {
++  state_t s;          /* ASCON alg. State structure */
++  uint8_t ipad[64];   /* HMAC: inner padding */
++  uint8_t opad[64];   /* HMAC: outer padding */
++};
++
++void asconhasha_init(struct asconhasha_ctx *ctx);
++void asconhasha_update(struct asconhasha_ctx *ctx, const uint8_t* in, uint64_t inlen);
++void asconhasha_final(struct asconhasha_ctx *ctx, uint8_t* out, uint64_t outlen);
++
++void asconhasha_hmac_init(struct asconhasha_ctx *ctx,const uint8_t *key, size_t keylen);
++void asconhasha_hmac_update(struct asconhasha_ctx *ctx, const uint8_t *input, size_t ilen);
++void asconhasha_hmac_final(struct asconhasha_ctx *ctx, uint8_t* out, uint64_t outlen);
++
++#endif /* ASCON_H */
+diff --git a/core/include/crypto/ascon_endian.h b/core/include/crypto/ascon_endian.h
+new file mode 100644
+index 00000000..f55ac3c7
+--- /dev/null
++++ b/core/include/crypto/ascon_endian.h
+@@ -0,0 +1,39 @@
++#ifndef __ASCON_ENDIAN_H__
++#define __ASCON_ENDIAN_H__
++
++#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++
++/* macros for big endian machines */
++#ifdef PRAGMA_ENDIAN
++#pragma message("Using macros for big endian machines")
++#endif
++#define U64BIG(x) (x)
++#define U32BIG(x) (x)
++#define U16BIG(x) (x)
++
++#elif defined(_MSC_VER) || \
++    (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
++
++/* macros for little endian machines */
++#ifdef PRAGMA_ENDIAN
++#pragma message("Using macros for little endian machines")
++#endif
++#define U64BIG(x)                          \
++  (((0x00000000000000FFULL & (x)) << 56) | \
++   ((0x000000000000FF00ULL & (x)) << 40) | \
++   ((0x0000000000FF0000ULL & (x)) << 24) | \
++   ((0x00000000FF000000ULL & (x)) << 8) |  \
++   ((0x000000FF00000000ULL & (x)) >> 8) |  \
++   ((0x0000FF0000000000ULL & (x)) >> 24) | \
++   ((0x00FF000000000000ULL & (x)) >> 40) | \
++   ((0xFF00000000000000ULL & (x)) >> 56))
++#define U32BIG(x)                                           \
++  (((0x000000FF & (x)) << 24) | ((0x0000FF00 & (x)) << 8) | \
++   ((0x00FF0000 & (x)) >> 8) | ((0xFF000000 & (x)) >> 24))
++#define U16BIG(x) (((0x00FF & (x)) << 8) | ((0xFF00 & (x)) >> 8))
++
++#else
++#error "Ascon byte order macros not defined in endian.h"
++#endif
++
++#endif /* __ASCON_ENDIAN_H__ */
+diff --git a/core/include/crypto/ascon_forceinline.h b/core/include/crypto/ascon_forceinline.h
+new file mode 100644
+index 00000000..55597f31
+--- /dev/null
++++ b/core/include/crypto/ascon_forceinline.h
+@@ -0,0 +1,19 @@
++#ifndef __ASCON_FORCEINLINE_H__
++#define __ASCON_FORCEINLINE_H__
++
++/* define forceinline macro */
++#ifdef _MSC_VER
++#define forceinline __forceinline
++#elif defined(__GNUC__)
++#define forceinline inline __attribute__((__always_inline__))
++#elif defined(__CLANG__)
++#if __has_attribute(__always_inline__)
++#define forceinline inline __attribute__((__always_inline__))
++#else
++#define forceinline inline
++#endif
++#else
++#define forceinline inline
++#endif
++
++#endif /* __ASCON_FORCEINLINE_H__ */
+diff --git a/core/include/crypto/ascon_permutations.h b/core/include/crypto/ascon_permutations.h
+new file mode 100644
+index 00000000..cd11624d
+--- /dev/null
++++ b/core/include/crypto/ascon_permutations.h
+@@ -0,0 +1,135 @@
++#ifndef __ASCON_PERMUTATIONS_H__
++#define __ASCON_PERMUTATIONS_H__
++
++#include <stdint.h>
++
++#include "ascon.h"
++#include "ascon_round.h"
++
++#define ASCON_128_KEYBYTES 16
++#define ASCON_128A_KEYBYTES 16
++#define ASCON_80PQ_KEYBYTES 20
++
++#define ASCON_128_RATE 8
++#define ASCON_128A_RATE 16
++#define ASCON_HASH_RATE 8
++
++#define ASCON_128_PA_ROUNDS 12
++#define ASCON_128_PB_ROUNDS 6
++
++#define ASCON_128A_PA_ROUNDS 12
++#define ASCON_128A_PB_ROUNDS 8
++
++#define ASCON_HASH_PA_ROUNDS 12
++#define ASCON_HASH_PB_ROUNDS 12
++
++#define ASCON_HASHA_PA_ROUNDS 12
++#define ASCON_HASHA_PB_ROUNDS 8
++
++#define ASCON_HASH_BYTES 32
++
++#define ASCON_128_IV WORD_T(0x80400c0600000000ull)
++#define ASCON_128A_IV WORD_T(0x80800c0800000000ull)
++#define ASCON_80PQ_IV WORD_T(0xa0400c0600000000ull)
++#define ASCON_HASH_IV WORD_T(0x00400c0000000100ull)
++#define ASCON_HASHA_IV WORD_T(0x00400c0400000100ull)
++#define ASCON_XOF_IV WORD_T(0x00400c0000000000ull)
++#define ASCON_XOFA_IV WORD_T(0x00400c0400000000ull)
++
++#define ASCON_HASH_IV0 WORD_T(0xee9398aadb67f03dull)
++#define ASCON_HASH_IV1 WORD_T(0x8bb21831c60f1002ull)
++#define ASCON_HASH_IV2 WORD_T(0xb48a92db98d5da62ull)
++#define ASCON_HASH_IV3 WORD_T(0x43189921b8f8e3e8ull)
++#define ASCON_HASH_IV4 WORD_T(0x348fa5c9d525e140ull)
++
++#define ASCON_HASHA_IV0 WORD_T(0x01470194fc6528a6ull)
++#define ASCON_HASHA_IV1 WORD_T(0x738ec38ac0adffa7ull)
++#define ASCON_HASHA_IV2 WORD_T(0x2ec8e3296c76384cull)
++#define ASCON_HASHA_IV3 WORD_T(0xd6f6a54d7f52377dull)
++#define ASCON_HASHA_IV4 WORD_T(0xa13c42a223be8d87ull)
++
++#define ASCON_XOF_IV0 WORD_T(0xb57e273b814cd416ull)
++#define ASCON_XOF_IV1 WORD_T(0x2b51042562ae2420ull)
++#define ASCON_XOF_IV2 WORD_T(0x66a3a7768ddf2218ull)
++#define ASCON_XOF_IV3 WORD_T(0x5aad0a7a8153650cull)
++#define ASCON_XOF_IV4 WORD_T(0x4f3e0e32539493b6ull)
++
++#define ASCON_XOFA_IV0 WORD_T(0x44906568b77b9832ull)
++#define ASCON_XOFA_IV1 WORD_T(0xcd8d6cae53455532ull)
++#define ASCON_XOFA_IV2 WORD_T(0xf7b5212756422129ull)
++#define ASCON_XOFA_IV3 WORD_T(0x246885e1de0d225bull)
++#define ASCON_XOFA_IV4 WORD_T(0xa8cb5ce33449973full)
++
++#define START(n) ((3 + (n)) << 4 | (12 - (n)))
++#define RC(c) WORD_T(c)
++
++forceinline void P12ROUNDS(state_t* s) {
++  ROUND(s, RC(0xf0));
++  ROUND(s, RC(0xe1));
++  ROUND(s, RC(0xd2));
++  ROUND(s, RC(0xc3));
++  ROUND(s, RC(0xb4));
++  ROUND(s, RC(0xa5));
++  ROUND(s, RC(0x96));
++  ROUND(s, RC(0x87));
++  ROUND(s, RC(0x78));
++  ROUND(s, RC(0x69));
++  ROUND(s, RC(0x5a));
++  ROUND(s, RC(0x4b));
++}
++
++forceinline void P8ROUNDS(state_t* s) {
++  ROUND(s, RC(0xb4));
++  ROUND(s, RC(0xa5));
++  ROUND(s, RC(0x96));
++  ROUND(s, RC(0x87));
++  ROUND(s, RC(0x78));
++  ROUND(s, RC(0x69));
++  ROUND(s, RC(0x5a));
++  ROUND(s, RC(0x4b));
++}
++
++forceinline void P6ROUNDS(state_t* s) {
++  ROUND(s, RC(0x96));
++  ROUND(s, RC(0x87));
++  ROUND(s, RC(0x78));
++  ROUND(s, RC(0x69));
++  ROUND(s, RC(0x5a));
++  ROUND(s, RC(0x4b));
++}
++
++forceinline void PROUNDS(state_t* s, int nr) {
++  for (int i = START(nr); i > 0x4a; i -= 0x0f) ROUND(s, RC(i));
++}
++
++#if ASCON_INLINE_PERM && ASCON_UNROLL_LOOPS
++
++forceinline void P(state_t* s, int nr) {
++  if (nr == 12) P12ROUNDS(s);
++  if (nr == 8) P8ROUNDS(s);
++  if (nr == 6) P6ROUNDS(s);
++}
++
++#elif !ASCON_INLINE_PERM && ASCON_UNROLL_LOOPS
++
++void P12(state_t* s);
++void P8(state_t* s);
++void P6(state_t* s);
++
++forceinline void P(state_t* s, int nr) {
++  if (nr == 12) P12(s);
++  if (nr == 8) P8(s);
++  if (nr == 6) P6(s);
++}
++
++#elif ASCON_INLINE_PERM && !ASCON_UNROLL_LOOPS
++
++forceinline void P(state_t* s, int nr) { PROUNDS(s, nr); }
++
++#else /* !ASCON_INLINE_PERM && !ASCON_UNROLL_LOOPS */
++
++void P(state_t* s, int nr);
++
++#endif
++
++#endif /* PERMUTATIONS_H_ */
+diff --git a/core/include/crypto/ascon_round.h b/core/include/crypto/ascon_round.h
+new file mode 100644
+index 00000000..8cbbb6ce
+--- /dev/null
++++ b/core/include/crypto/ascon_round.h
+@@ -0,0 +1,50 @@
++#ifndef __ASCON_ROUND_H__
++#define __ASCON_ROUND_H__
++
++#include "ascon.h"
++
++forceinline void KINIT(word_t* K0, word_t* K1, word_t* K2) {
++  *K0 = WORD_T(0);
++  *K1 = WORD_T(0);
++  *K2 = WORD_T(0);
++}
++
++forceinline void PINIT(state_t* s) {
++  s->x0 = WORD_T(0);
++  s->x1 = WORD_T(0);
++  s->x2 = WORD_T(0);
++  s->x3 = WORD_T(0);
++  s->x4 = WORD_T(0);
++}
++
++forceinline void ROUND(state_t* s, word_t C) {
++  state_t t;
++  /* round constant */
++  s->x2 = XOR(s->x2, C);
++  /* s-box layer */
++  s->x0 = XOR(s->x0, s->x4);
++  s->x4 = XOR(s->x4, s->x3);
++  s->x2 = XOR(s->x2, s->x1);
++  t.x0 = XOR(s->x0, AND(NOT(s->x1), s->x2));
++  t.x2 = XOR(s->x2, AND(NOT(s->x3), s->x4));
++  t.x4 = XOR(s->x4, AND(NOT(s->x0), s->x1));
++  t.x1 = XOR(s->x1, AND(NOT(s->x2), s->x3));
++  t.x3 = XOR(s->x3, AND(NOT(s->x4), s->x0));
++  t.x1 = XOR(t.x1, t.x0);
++  t.x3 = XOR(t.x3, t.x2);
++  t.x0 = XOR(t.x0, t.x4);
++  /* linear layer */
++  s->x2 = XOR(t.x2, ROR(t.x2, 6 - 1));
++  s->x3 = XOR(t.x3, ROR(t.x3, 17 - 10));
++  s->x4 = XOR(t.x4, ROR(t.x4, 41 - 7));
++  s->x0 = XOR(t.x0, ROR(t.x0, 28 - 19));
++  s->x1 = XOR(t.x1, ROR(t.x1, 61 - 39));
++  s->x2 = XOR(t.x2, ROR(s->x2, 1));
++  s->x3 = XOR(t.x3, ROR(s->x3, 10));
++  s->x4 = XOR(t.x4, ROR(s->x4, 7));
++  s->x0 = XOR(t.x0, ROR(s->x0, 19));
++  s->x1 = XOR(t.x1, ROR(s->x1, 39));
++  s->x2 = NOT(s->x2);
++}
++
++#endif /* __ASCON_ROUND_H__ */
+diff --git a/core/include/crypto/ascon_word.h b/core/include/crypto/ascon_word.h
+new file mode 100644
+index 00000000..c4c98d1e
+--- /dev/null
++++ b/core/include/crypto/ascon_word.h
+@@ -0,0 +1,69 @@
++#ifndef __ASCON_WORD_H__
++#define __ASCON_WORD_H__
++
++#include <stdint.h>
++
++#include "ascon_endian.h"
++#include "ascon_forceinline.h"
++
++typedef uint64_t word_t;
++
++#define WORD_T
++#define UINT64_T
++#define U64TOWORD
++#define WORDTOU64
++
++forceinline word_t ROR(word_t x, int n) { return x >> n | x << (64 - n); }
++
++forceinline word_t NOT(word_t a) { return ~a; }
++
++forceinline word_t XOR(word_t a, word_t b) { return a ^ b; }
++
++forceinline word_t AND(word_t a, word_t b) { return a & b; }
++
++forceinline word_t KEYROT(word_t lo2hi, word_t hi2lo) {
++  return lo2hi << 32 | hi2lo >> 32;
++}
++
++forceinline int NOTZERO(word_t a, word_t b) {
++  uint64_t result = a | b;
++  result |= result >> 32;
++  result |= result >> 16;
++  result |= result >> 8;
++  return ((((int)(result & 0xff) - 1) >> 8) & 1) - 1;
++}
++
++forceinline word_t PAD(int i) { return 0x80ull << (56 - 8 * i); }
++
++forceinline word_t CLEAR(word_t w, int n) {
++  /* undefined for n == 0 */
++  uint64_t mask = 0x00ffffffffffffffull >> (n * 8 - 8);
++  return w & mask;
++}
++
++forceinline uint64_t MASK(int n) {
++  /* undefined for n == 0 */
++  return ~0ull >> (64 - 8 * n);
++}
++
++forceinline word_t LOAD(const uint8_t* bytes, int n) {
++  uint64_t x = *(uint64_t*)bytes & MASK(n);
++  return U64BIG(x);
++}
++
++forceinline void STORE(uint8_t* bytes, word_t w, int n) {
++  *(uint64_t*)bytes &= ~MASK(n);
++  *(uint64_t*)bytes |= U64BIG(w);
++}
++
++forceinline word_t LOADBYTES(const uint8_t* bytes, int n) {
++  uint64_t x = 0;
++  for (int i = 0; i < n; ++i) ((uint8_t*)&x)[7 - i] = bytes[i];
++  return x;
++}
++
++forceinline void STOREBYTES(uint8_t* bytes, word_t w, int n) {
++  for (int i = 0; i < n; ++i) bytes[i] = ((uint8_t*)&w)[7 - i];
++}
++
++#endif /* __ASCON_WORD_H__ */
+diff --git a/core/include/crypto/crypto_impl.h b/core/include/crypto/crypto_impl.h
+index ab1f1bed..5497bb25 100644
+--- a/core/include/crypto/crypto_impl.h
++++ b/core/include/crypto/crypto_impl.h
+@@ -76,6 +76,12 @@ TEE_Result crypto_sm3_alloc_ctx(struct crypto_hash_ctx **ctx);
+ CRYPTO_ALLOC_CTX_NOT_IMPLEMENTED(sm3, hash)
+ #endif
+ 
++#if defined(CFG_CRYPTO_ASCONHASHA)
++TEE_Result crypto_asconhasha_alloc_ctx(struct crypto_hash_ctx **ctx);
++#else
++CRYPTO_ALLOC_CTX_NOT_IMPLEMENTED(asconhasha, hash)
++#endif
++
+ /*
+  * The crypto context used by the crypto_mac_*() functions is defined by
+  * struct crypto_mac_ctx.
+@@ -118,6 +124,12 @@ TEE_Result crypto_hmac_sm3_alloc_ctx(struct crypto_mac_ctx **ctx);
+ CRYPTO_ALLOC_CTX_NOT_IMPLEMENTED(hmac_sm3, mac)
+ #endif
+ 
++#if defined(CFG_CRYPTO_ASCONHASHA) && defined(CFG_CRYPTO_HMAC)
++TEE_Result crypto_hmac_asconhasha_alloc_ctx(struct crypto_mac_ctx **ctx);
++#else
++CRYPTO_ALLOC_CTX_NOT_IMPLEMENTED(hmac_asconhasha, mac)
++#endif
++
+ #if defined(CFG_CRYPTO_CBC_MAC)
+ TEE_Result crypto_aes_cbc_mac_nopad_alloc_ctx(struct crypto_mac_ctx **ctx);
+ TEE_Result crypto_aes_cbc_mac_pkcs5_alloc_ctx(struct crypto_mac_ctx **ctx);
+@@ -229,6 +241,7 @@ TEE_Result crypto_sm4_ctr_alloc_ctx(struct crypto_cipher_ctx **ctx);
+ CRYPTO_ALLOC_CTX_NOT_IMPLEMENTED(sm4_ctr, cipher)
+ #endif
+ 
++
+ /*
+  * The crypto context used by the crypto_authen_*() functions below is
+  * defined by struct crypto_authenc_ctx.
+diff --git a/core/include/kernel/interrupt.h b/core/include/kernel/interrupt.h
+index 20afc72d..c6abb49a 100644
+--- a/core/include/kernel/interrupt.h
++++ b/core/include/kernel/interrupt.h
+@@ -19,6 +19,7 @@ struct itr_chip {
+ 
+ struct itr_ops {
+ 	void (*add)(struct itr_chip *chip, size_t it, uint32_t flags);
++	void (*add_cpumask)(struct itr_chip *chip, size_t it, uint32_t flags, uint32_t cpumask);
+ 	void (*enable)(struct itr_chip *chip, size_t it);
+ 	void (*disable)(struct itr_chip *chip, size_t it);
+ 	void (*raise_pi)(struct itr_chip *chip, size_t it);
+@@ -40,6 +41,7 @@ typedef enum itr_return (*itr_handler_t)(struct itr_handler *h);
+ struct itr_handler {
+ 	size_t it;
+ 	uint32_t flags;
++	uint32_t cpu_mask;
+ 	itr_handler_t handler;
+ 	void *data;
+ 	SLIST_ENTRY(itr_handler) link;
+@@ -65,6 +67,7 @@ struct itr_handler *itr_alloc_add(size_t it, itr_handler_t handler,
+ 				  uint32_t flags, void *data);
+ void itr_free(struct itr_handler *hdl);
+ void itr_add(struct itr_handler *handler);
++void itr_add_cpumask(struct itr_handler *h);
+ void itr_enable(size_t it);
+ void itr_disable(size_t it);
+ /* raise the Peripheral Interrupt corresponding to the interrupt ID */
+diff --git a/core/include/tee/tee_svc.h b/core/include/tee/tee_svc.h
+index 27a04c05..59b9d1d1 100644
+--- a/core/include/tee/tee_svc.h
++++ b/core/include/tee/tee_svc.h
+@@ -74,4 +74,6 @@ TEE_Result syscall_wait(unsigned long timeout);
+ TEE_Result syscall_get_time(unsigned long cat, TEE_Time *time);
+ TEE_Result syscall_set_ta_time(const TEE_Time *time);
+ 
++TEE_Result syscall_runtime_driver_ops(void);
++
+ #endif /* TEE_SVC_H */
+diff --git a/core/kernel/interrupt.c b/core/kernel/interrupt.c
+index fa3c9784..b5fe8f66 100644
+--- a/core/kernel/interrupt.c
++++ b/core/kernel/interrupt.c
+@@ -106,6 +106,19 @@ void itr_add(struct itr_handler *h)
+ 	SLIST_INSERT_HEAD(&handlers, h, link);
+ }
+ 
++void itr_add_cpumask(struct itr_handler *h)
++{
++	struct itr_handler __maybe_unused *hdl = NULL;
++
++	SLIST_FOREACH(hdl, &handlers, link)
++		if (hdl->it == h->it)
++			assert((hdl->flags & ITRF_SHARED) &&
++			       (h->flags & ITRF_SHARED));
++
++	itr_chip->ops->add_cpumask(itr_chip, h->it, h->flags, h->cpu_mask);
++	SLIST_INSERT_HEAD(&handlers, h, link);
++}
++
+ void itr_enable(size_t it)
+ {
+ 	itr_chip->ops->enable(itr_chip, it);
+diff --git a/core/tee/tee_svc.c b/core/tee/tee_svc.c
+index 00352914..f9768c56 100644
+--- a/core/tee/tee_svc.c
++++ b/core/tee/tee_svc.c
+@@ -1006,3 +1006,14 @@ TEE_Result syscall_set_ta_time(const TEE_Time *mytime)
+ 
+ 	return tee_time_set_ta_time((const void *)&s->ctx->uuid, &t);
+ }
++
++
++#include <cv2x.h>
++TEE_Result syscall_runtime_driver_ops(void)
++{
++	TEE_Result res = TEE_SUCCESS;
++
++	res = init_suxi_timer1();
++
++	return res;
++}
+diff --git a/core/tee/tee_svc_cryp.c b/core/tee/tee_svc_cryp.c
+index 5ed54250..fe9eb3ec 100644
+--- a/core/tee/tee_svc_cryp.c
++++ b/core/tee/tee_svc_cryp.c
+@@ -434,6 +434,9 @@ static const struct tee_cryp_obj_type_props tee_cryp_obj_props[] = {
+ 	PROP(TEE_TYPE_HMAC_SM3, 8, 80, 1024,
+ 		512 / 8 + sizeof(struct tee_cryp_obj_secret),
+ 		tee_cryp_obj_secret_value_attrs),
++	PROP(TEE_TYPE_HMAC_ASCONHASHA, 8, 192, 1024,
++		512 / 8 + sizeof(struct tee_cryp_obj_secret),
++		tee_cryp_obj_secret_value_attrs),		
+ 	PROP(TEE_TYPE_GENERIC_SECRET, 8, 0, 4096,
+ 		4096 / 8 + sizeof(struct tee_cryp_obj_secret),
+ 		tee_cryp_obj_secret_value_attrs),
+@@ -1934,6 +1937,7 @@ TEE_Result syscall_obj_generate_key(unsigned long obj, unsigned long key_size,
+ 	case TEE_TYPE_HMAC_SHA384:
+ 	case TEE_TYPE_HMAC_SHA512:
+ 	case TEE_TYPE_HMAC_SM3:
++	case TEE_TYPE_HMAC_ASCONHASHA:	
+ 	case TEE_TYPE_GENERIC_SECRET:
+ 		byte_size = key_size / 8;
+ 
+@@ -2082,6 +2086,9 @@ static TEE_Result tee_svc_cryp_check_key_type(const struct tee_obj *o,
+ 	case TEE_MAIN_ALGO_SM3:
+ 		req_key_type = TEE_TYPE_HMAC_SM3;
+ 		break;
++	case TEE_MAIN_ALGO_ASCONHASHA:
++		req_key_type = TEE_TYPE_HMAC_ASCONHASHA;
++		break;		
+ 	case TEE_MAIN_ALGO_AES:
+ 		req_key_type = TEE_TYPE_AES;
+ 		break;
+diff --git a/lib/libutee/arch/arm/utee_syscalls_asm.S b/lib/libutee/arch/arm/utee_syscalls_asm.S
+index 44bc60d2..d71fbf98 100644
+--- a/lib/libutee/arch/arm/utee_syscalls_asm.S
++++ b/lib/libutee/arch/arm/utee_syscalls_asm.S
+@@ -122,3 +122,5 @@
+                      TEE_SCN_CRYP_OBJ_GENERATE_KEY, 4
+ 
+         UTEE_SYSCALL _utee_cache_operation, TEE_SCN_CACHE_OPERATION, 3
++
++        UTEE_SYSCALL _utee_runtime_driver_ops, TEE_SCN_RUNTIME_DRIVER_OPS, 0
+diff --git a/lib/libutee/include/tee_api.h b/lib/libutee/include/tee_api.h
+index 251af3ce..b61adcc3 100644
+--- a/lib/libutee/include/tee_api.h
++++ b/lib/libutee/include/tee_api.h
+@@ -334,6 +334,8 @@ TEE_Result TEE_SetTAPersistentTime(const TEE_Time *time);
+ 
+ void TEE_GetREETime(TEE_Time *time);
+ 
++TEE_Result TEE_RuntimeDriverOps(void);
++
+ /* TEE Arithmetical API - Memory allocation and size of objects */
+ 
+ uint32_t TEE_BigIntFMMSizeInU32(uint32_t modulusSizeInBits);
+diff --git a/lib/libutee/include/tee_api_defines.h b/lib/libutee/include/tee_api_defines.h
+index 8518da63..97131a65 100644
+--- a/lib/libutee/include/tee_api_defines.h
++++ b/lib/libutee/include/tee_api_defines.h
+@@ -169,6 +169,7 @@
+ #define TEE_ALG_SHA256                          0x50000004
+ #define TEE_ALG_SHA384                          0x50000005
+ #define TEE_ALG_SHA512                          0x50000006
++#define TEE_ALG_ASCONHASHA                      0x50000008
+ #define TEE_ALG_MD5SHA1                         0x5000000F
+ #define TEE_ALG_HMAC_MD5                        0x30000001
+ #define TEE_ALG_HMAC_SHA1                       0x30000002
+@@ -177,6 +178,7 @@
+ #define TEE_ALG_HMAC_SHA384                     0x30000005
+ #define TEE_ALG_HMAC_SHA512                     0x30000006
+ #define TEE_ALG_HMAC_SM3                        0x30000007
++#define TEE_ALG_HMAC_ASCONHASHA                 0x30000008
+ /*
+  * Fix GP Internal Core API v1.1
+  *     "Table 6-12:  Structure of Algorithm Identifier"
+@@ -214,6 +216,7 @@
+ #define TEE_TYPE_HMAC_SHA384                0xA0000005
+ #define TEE_TYPE_HMAC_SHA512                0xA0000006
+ #define TEE_TYPE_HMAC_SM3                   0xA0000007 /* Not in spec */
++#define TEE_TYPE_HMAC_ASCONHASHA            0xA0000008 /* Not in spec */
+ #define TEE_TYPE_RSA_PUBLIC_KEY             0xA0000030
+ #define TEE_TYPE_RSA_KEYPAIR                0xA1000030
+ #define TEE_TYPE_DSA_PUBLIC_KEY             0xA0000031
+diff --git a/lib/libutee/include/tee_syscall_numbers.h b/lib/libutee/include/tee_syscall_numbers.h
+index 82d429b3..f723a726 100644
+--- a/lib/libutee/include/tee_syscall_numbers.h
++++ b/lib/libutee/include/tee_syscall_numbers.h
+@@ -79,8 +79,9 @@
+ #define TEE_SCN_SE_CHANNEL_CLOSE__DEPRECATED		69
+ /* End of deprecated Secure Element API syscalls */
+ #define TEE_SCN_CACHE_OPERATION			70
++#define TEE_SCN_RUNTIME_DRIVER_OPS      71
+ 
+-#define TEE_SCN_MAX				70
++#define TEE_SCN_MAX				71
+ 
+ /* Maximum number of allowed arguments for a syscall */
+ #define TEE_SVC_MAX_ARGS			8
+diff --git a/lib/libutee/include/utee_defines.h b/lib/libutee/include/utee_defines.h
+index 5a4f1bc4..bdcbdd67 100644
+--- a/lib/libutee/include/utee_defines.h
++++ b/lib/libutee/include/utee_defines.h
+@@ -22,6 +22,7 @@
+ #define TEE_MAIN_ALGO_SHA384     0x05
+ #define TEE_MAIN_ALGO_SHA512     0x06
+ #define TEE_MAIN_ALGO_SM3        0x07
++#define TEE_MAIN_ALGO_ASCONHASHA 0x08
+ #define TEE_MAIN_ALGO_AES        0x10
+ #define TEE_MAIN_ALGO_DES        0x11
+ #define TEE_MAIN_ALGO_DES2       0x12
+@@ -159,6 +160,7 @@ typedef enum {
+ 	TEE_SHA224_HASH_SIZE = 28,
+ 	TEE_SHA256_HASH_SIZE = 32,
+ 	TEE_SM3_HASH_SIZE = 32,
++	TEE_ASCONHASHA_HASH_SIZE = 32,	
+ 	TEE_SHA384_HASH_SIZE = 48,
+ 	TEE_SHA512_HASH_SIZE = 64,
+ 	TEE_MD5SHA1_HASH_SIZE = (TEE_MD5_HASH_SIZE + TEE_SHA1_HASH_SIZE),
+@@ -198,6 +200,9 @@ static inline size_t __tee_alg_get_digest_size(uint32_t algo)
+ 	case TEE_ALG_SM3:
+ 	case TEE_ALG_HMAC_SM3:
+ 		return TEE_SM3_HASH_SIZE;
++	case TEE_ALG_ASCONHASHA:
++	case TEE_ALG_HMAC_ASCONHASHA:
++		return TEE_ASCONHASHA_HASH_SIZE;		
+ 	case TEE_ALG_AES_CBC_MAC_NOPAD:
+ 	case TEE_ALG_AES_CBC_MAC_PKCS5:
+ 	case TEE_ALG_AES_CMAC:
+@@ -264,6 +269,7 @@ static inline size_t __tee_alg_get_digest_size(uint32_t algo)
+ #define TEE_U16_TO_BIG_ENDIAN(x)    TEE_U16_BSWAP(x)
+ 
+ #define TEE_TIME_MILLIS_BASE    1000
++#define TEE_TIME_MICROS_BASE    1000000
+ 
+ #define TEE_TIME_LT(t1, t2)				\
+     (((t1).seconds == (t2).seconds) ?			\
+diff --git a/lib/libutee/include/utee_syscalls.h b/lib/libutee/include/utee_syscalls.h
+index add095b0..9032b547 100644
+--- a/lib/libutee/include/utee_syscalls.h
++++ b/lib/libutee/include/utee_syscalls.h
+@@ -81,6 +81,8 @@ TEE_Result _utee_get_time(unsigned long cat, TEE_Time *time);
+ 
+ TEE_Result _utee_set_ta_time(const TEE_Time *time);
+ 
++TEE_Result _utee_runtime_driver_ops(void);
++
+ TEE_Result _utee_cryp_state_alloc(unsigned long algo, unsigned long op_mode,
+ 				  unsigned long key1, unsigned long key2,
+ 				  uint32_t *state);
+diff --git a/lib/libutee/tee_api.c b/lib/libutee/tee_api.c
+index 20acccba..df7dfe00 100644
+--- a/lib/libutee/tee_api.c
++++ b/lib/libutee/tee_api.c
+@@ -390,6 +390,17 @@ void TEE_GetREETime(TEE_Time *time)
+ 		TEE_Panic(res);
+ }
+ 
++TEE_Result TEE_RuntimeDriverOps(void)
++{
++	TEE_Result res;
++	res = _utee_runtime_driver_ops();
++
++	if (res != TEE_SUCCESS)
++		TEE_Panic(res);
++		
++	return res;
++}
++
+ void *TEE_Malloc(uint32_t len, uint32_t hint)
+ {
+ 	if (hint == TEE_MALLOC_FILL_ZERO)
+diff --git a/lib/libutee/tee_api_operations.c b/lib/libutee/tee_api_operations.c
+index 35ecd783..ff939a06 100644
+--- a/lib/libutee/tee_api_operations.c
++++ b/lib/libutee/tee_api_operations.c
+@@ -236,6 +236,7 @@ TEE_Result TEE_AllocateOperation(TEE_OperationHandle *operation,
+ 	case TEE_ALG_SHA384:
+ 	case TEE_ALG_SHA512:
+ 	case TEE_ALG_SM3:
++	case TEE_ALG_ASCONHASHA:	
+ 		if (mode != TEE_MODE_DIGEST)
+ 			return TEE_ERROR_NOT_SUPPORTED;
+ 		if (maxKeySize)
+@@ -260,6 +261,7 @@ TEE_Result TEE_AllocateOperation(TEE_OperationHandle *operation,
+ 	case TEE_ALG_HMAC_SHA384:
+ 	case TEE_ALG_HMAC_SHA512:
+ 	case TEE_ALG_HMAC_SM3:
++	case TEE_ALG_HMAC_ASCONHASHA:	
+ 		if (mode != TEE_MODE_MAC)
+ 			return TEE_ERROR_NOT_SUPPORTED;
+ 		req_key_usage = TEE_USAGE_MAC;

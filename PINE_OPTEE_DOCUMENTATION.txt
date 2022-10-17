@@ -1,0 +1,451 @@
+@ Filename: PineA64_Trusted-Execution-Environment_Setup-Documentation
+@ Author: Spandan Mahadevegowda <spandan@vt.edu>
+@ Org: Bradley Dept of ECE, Virginia Tech
+@ Last Updated: Oct-20-2021
+
+>>>>>>>>>>>>>>>>>>>> PINE64-LTS AND PINEPHONE-A64 OP-TEE SETUP DETAILS <<<<<<<<<<<<<<<<<<<<<<<<
+
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+SECTION 1 - Architecture and General Information
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+1.1. A64 BootFlow
+
+     BootROM (BL1, NS)
+         |
+         |
+         V
+        SPL (BL2, NS)   
+         |
+         |
+         V
+     ARM-TF (BL31, S) <------> OP-TEE (BL32, S)
+         |
+         |
+         V
+     U-BOOT (BL33, NS)
+         |
+         |
+         V
+     Rich OS (Linux) 
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+*** BLxx are bootload levels synonymous to AArch64 exception models with exception levels. 
+    NS - NonSecure World, S - Secure World
+*** The BootROM of the device loads SPL which inturn loads ARM-TF. ARM-TF then checks the OPTEE
+	binary and loads OP-TEE after initializing memory and verifying OP-TEE headers. The OPTEE p
+	-erforms all required init calls and then returns control back to ARM-TF which lo
+    -ads the U-BOOT. U-Boot does the neccessary checks and loads the kernel boot of the rich
+    OS which then loads the Rich OS on memory
+*** In the above flow, only default SPL and BootROM work in their native format. The other c
+    -omponents require manual changes:
+    * ARM-TF  : Build this component with option to enable OP-TEE (Refer Sec 2.2.3.1)
+    * OP-TEE  : Build for sunxi-sun50i_a64 
+    * U-BOOT  : Build the component after modifying the shell script to merge OP-TEE, SPL, 
+                ARM-TF and U-Boot into a single binary file (Refer Sec 2.2.3.4)
+    * Rich OS : The DTB of the kernel boot image has to be modified to load OP-TEE drivers
+                (Refer Sec 2.2.3.5)
+
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+
+
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+SECTION 2 - Repo and Build
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+2.1. QEMU
+QEMU is an emulator and a hardware virtualization software. Before moving on to the actual h
+-ardware, it is better to setup the QEMU v8 with OP-TEE to understand the working of Normal 
+world and Secure world interaction. The setup for QEMU also sets up many dependencies requir
+-ed in building OP-TEE based environment on the Pine hardware.
+
+````````````````````````````````````````````````````````````````````````````````````````````
+2.1.1. >> Prerequisites <<
+QEMU installation requires quite a few packages to compile and run. 
+
+~Run the following commands and install prerequisites packages:
+> sudo dpkg --add-architecture i386
+> sudo apt-get upgrade
+> sudo apt-get install android-tools-adb android-tools-fastboot autoconf \
+        automake bc bison build-essential ccache cscope curl device-tree-compiler \
+        expect flex ftp-upload gdisk iasl libattr1-dev libcap-dev \
+        libfdt-dev libftdi-dev libglib2.0-dev libgmp-dev libhidapi-dev \
+        libmpc-dev libncurses5-dev libpixman-1-dev libssl-dev libtool make \
+        mtools netcat ninja-build python-crypto python3-crypto python-pyelftools \
+        python3-pycryptodome python3-pyelftools python-serial python3-serial \
+        rsync unzip uuid-dev xdg-utils xterm xz-utils zlib1g-dev
+
+*** For latest versions of python3 some packages above with python-<package> will not be ins
+    -tall with pip3, instead use python3-<package> to get relevant packages
+
+````````````````````````````````````````````````````````````````````````````````````````````
+2.1.2. >> Source code of QEMU <<
+OP-TEE source code for QEMU is mainted as a target XML file and can be obtained using repo o
+-n the manifest in the OP-TEE repo.
+
+~Commands
+> mkdir -p <qemu_dir>
+> cd 
+> repo init -u https://github.com/OP-TEE/manifest.git -m qemu_v8.xml -b 3.12.0
+> repo sync -j4 --no-clone-bundle
+
+*** The version of OP-TEE used during the time of this documentation is v3.12.0. Please chan
+-ge as required. 
+*** the command 'repo' works directly if python2 or python3 is aliased as python and is in t
+    -he PATH of linux. If not use "/usr/bin/python3 repo ..." or "path_to_python3/python2 
+    repo ..."
+*** To alias python3 or python2 as python when '/usr/bin' is in PATH
+    > sudo ln -s /usr/bin/python3 /usr/bin/python
+
+````````````````````````````````````````````````````````````````````````````````````````````
+2.1.3. >> Build QEMU <<
+Build the QEMU with OPTEE V8
+
+~Comamnds
+> cd <qemu_dir>/build
+> make -j4 toolchains
+> make run
+
+This will open a serial terminal for QEMU debug, Normal World Emulation and Secure World emu
+-lation. Press 'c' in QEMU terminal to load the Normal and Secure worlds. Any prebuilt optee
+code in optee_examples directory inside QEMU can be executed by logging in as root or test i
+-n Normal World Terminal and executing optee_example_<ta_name>
+
+````````````````````````````````````````````````````````````````````````````````````````````
+2.1.4. >> OPTEE_EXAMPLES <<
+**TODO
+
+############################################################################################
+2.2. HARDWARE BUILD AND TEST
+We have two hardware builds to support and though the general flow of build and execution o
+-n the hardware is the same, we will need minor tweaks in the build for the different hardw
+-are environments. The differences will be highlightes using tags like 'LTS' for Pine64-LTS
+and 'PHN' for Pinephone A64.
+
+````````````````````````````````````````````````````````````````````````````````````````````
+2.2.1. >> Prerequisites <<
+Most of the prerequisites are already installed if QEMU is setup before trying to work on t
+-he HW. One main requirements to build for Pine HW is the aarch32 and aarch64 compilers. Th
+-is is found inside <qemu_dir>/toolchains. Any other dependency would be required in buildi
+-ng the Rich OS, which is left to the project as this is OS specific and should be installe
+-d as required.
+Also, U-Boot requires swig, python3-dev/python-dev and device-tree-compiler to be installed.
+
+````````````````````````````````````````````````````````````````````````````````````````````
+2.2.2. >> Source Code <<
+As seen in Section 1.1, the HW setup environment has many components and therefore requires
+different repositories.
+
+*** ARM-Trusted Firmware 
+git clone https://review.trustedfirmware.org/TF-A/trusted-firmware-a -b v2.2
+(For version > v2.2 use dirty fix in Sec 2.2.3.1)
+
+*** OP-TEE OS
+git clone https://github.com/OP-TEE/optee_os.git -b 3.8.0
+
+*** OP-TEE CLIENT (Version must match OP-TEE OS)
+git clone https://github.com/OP-TEE/optee_client -b 3.8.0 
+
+*** OP-TEE EXAMPLES
+git clone https://github.com/linaro-swg/optee_examples.git
+
+*** U-BOOT
+>LTS<
+git clone https://gitlab.denx.de/u-boot/u-boot.git -b v2020.04-rc3
+>PHN<
+**TODO
+
+*** LINUX
+git clone https://github.com/torvalds/linux.git -b v5.6 --depth=1
+
+````````````````````````````````````````````````````````````````````````````````````````````
+2.2.3. >> Build - Bare Metal OP-TEE + Rich OS <<
+Since we build on the x86 architecure while the device is AArch64, we need to ensure the cor
+-rect compilers are avaiable. In the below subsections we will only built the individual com
+-ponents and then Section<UP> will detail on putting all these together for the HW.
+
+~Commands
+> export PATH=$PATH:<path to aarch64 binaries>:<path to aarch32 binaries>
+> export CROSS_COMPILE="ccache aarch64-linux-gnu-"
+
+*** aarch64/aarch32 binaries can be found in <qemu_dir>/toolchains. Copy path to aarch64/aar
+    -ch32 bin directories. If QEMU is not setup the binaries have to be installed either via
+    QEMU static package or standalone package.
+
+--------------------------------------------------------------------------------------------
+2.2.3.1. ARM-TF Build
+
+> cd trsuted-firmware-a
+> make distclean
+> make clean
+> make PLAT=sun50i_a64 SPD=opteed DEBUG=1 bl31
+> export BL31=$(pwd)/build/sun50i_a64/debug/bl31.bin
+
+*** Dirty Fix for verion of ARM-TF v2.3+ : The code will exceed the BL31_LIMIT set in the li
+    -nker script for sun50i_a64 when compiled with DEBUG=1. To handle this we currently do a
+    dirty fix of change "#define SUNXI_SCP_SIZE" from 0x4000 to 0x3000 in 
+    <plat/allwinner/common/include/platform_def.h>. This should increase the BL31_LIMIT and 
+    add an additional 4kB of space for RAM region of BL31 in SRAM_A2.
+
+--------------------------------------------------------------------------------------------
+2.2.3.2. OPTEE OS Build
+
+> cd optee_os
+> make clean PLATFORM=sunxi-sun50i_a64
+> make CFG_ARM64_CORE=y \
+  CFG_TEE_LOGLEVEL=4 \
+  CFG_TEE_CORE_LOG_LEVEL=4 \
+  CFG_CORE_DEBUG_CHECK_STACKS=1 \
+  CROSS_COMPILE32="ccache arm-linux-gnueabihf-" \
+  CROSS_COMPILE64="ccache aarch64-linux-gnu-" \
+  DEBUG=4 \
+  PLATFORM=sunxi-sun50i_a64
+> export TEE=$(pwd)/out/arm-plat-sunxi/core/tee-pager_v2.bin
+
+*** The OP-TEE header in tee.bin and tee-pager_v2.bin are different. For ARM-TF v2.0 and abo
+    -ve, use tee-pager_v2.bin or the ARM-TF will indefinetly get stuck in searching for OP-T
+    -EE header.
+*** Change DEBUG LEVELS as required. 
+    0 - None
+    1 - Error
+    2 - Error + Warning
+    3 - Error + Warning + Debug
+    4 - Error + Warning + Debug + Flow
+
+--------------------------------------------------------------------------------------------
+2.2.3.3. OPTEE CLIENT Build
+
+> cd optee_client
+> make clean
+> make
+
+-----------------------------------------------------------------------------------------------
+2.2.3.4. U-BOOT Build
+
+The U-BOOT requires modifications in the shell script to package OPTEE as part of the binary th
+-at has to be flashed to the device/sd-card. 
+>LTS< + >PHN<
+Apply the optee_uboot_2021-01.patch on the cloned <u-boot(v2021.01)> repository and run the bel
+-ow commands. 
+
+~Commands
+> cd u-boot
+> make clean
+> make pine64-lts_defconfig
+> make
+> export PATH=$PATH:$(pwd)/tools/
+
+***	The patch includes taking in the OPTEE binary in $TEE export from OPTEE OS build for the on
+	SPL FIT based DTB generation using binman. This generates a unique binary for sunxi devices
+	that includes the SPL, ARM-TF, UBOOT, OPTEE all in a single file(u-boot-sunxi-with-spl.bin)
+
+-----------------------------------------------------------------------------------------------
+2.2.3.5 Rich OS Build
+Arch Linux v5.6 used for Pine64-LTS while **TODO used for Pinephone-A64
+
+>LTS<
+The kernel boot image has to recognize and load the OP-TEE drivers before it loads the actua
+-l kernel. To do this, we need to modify the DTS file so that the required changes to load O
+-P-TEE driver are avaialble in the genetered DTB file. 
+For Pine HW the files are under 
+    <linux_dir>/arch/arm64/boot/dts/allwinner/*
+
+Under the main block of the .dts file add OP-TEE as a smc firmware, the dts file for 
+'sun50i-a64-pine64-lts.dts' would look as (enclosed within in the ``` lines)
+
+````````````````````````````````````````````````````````````````````````````````````````````
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+// Copyright (c) 2018 ARM Ltd.
+
+#include "sun50i-a64-sopine-baseboard.dts"
+
+/ {
+    model = "Pine64 LTS";
+    compatible = "pine64,pine64-lts", "allwinner,sun50i-r18",
+             "allwinner,sun50i-a64";
+
+    firmware {
+        optee {
+         compatible = "linaro,optee-tz";
+         method = "smc";
+        };
+    };
+};
+
+````````````````````````````````````````````````````````````````````````````````````````````
+~Commands
+> cd linux
+> make ARCH=arm64 defconfig
+> make ARCH=arm64 -j2 Image 
+> make ARCH=arm64 -j2 dtbs
+> make -j2 ARCH=arm64 modules
+> make -j2 ARCH=arm64 INSTALL_MOD_PATH=modules modules_install
+
+*** Above we build the Kernel Boot Image, then the device trees (dtbs) and the modules for t
+    -he Rich OS.
+*** The default build does not include the MALI 400 GPU drivers, this has to be enabled duri
+    - the build configuration or before(by using menuconfig after making defconfig above)
+
+>PHN<
+**TODO
+
+```````````````````````````````````````````````````````````````````````````````````````````````
+2.2.4. >> Creating the Bootable SD-Card <<
+The instructions for this setup is for OPTEE + Rich OS on Pine64-LTS and Pinephone64 with an SD
+card. 
+
+-----------------------------------------------------------------------------------------------
+2.2.4.1 Partitioning the SD Card
+We need to create proper partitions and filesystem on the sd card for the TEE and Rich OS. For 
+sunxi devices, the U-Boot build generates "u-boot-sunxi-with-spl.bin" which has to be placed st
+-arting at the first 8k sector. This binary includes the SPL + ARM-TF + U-BOOT + OPTEE-OS and i
+-s usually around 1.6 MB. Therefore the file system for rich os will start at 2 MB. Additionall
+-y for better maintainability, we create a vfat partition for the kernel bootloader and a bigge
+-r ext4 debootstrapped filesystem for the Rich OS kernel.
+
+~Commands
+> sudo dd if=/dev/zero of=/dev/sdX bs=1M count=1
+> sudo blockdev --rereadpt /dev/sdX
+> cat <<EOT | sudo sfdisk /dev/sdX
+2M,32M,c
+32M,,L
+EOT
+> sudo mkfs.vfat /dev/sdX1
+> sudo mkfs.ext4 /dev/sdX2
+
+*** get the block name of the sd card using command lsblk. 'X' above has to be replaced by the 
+	respective letter assigned to the sd card. Also ensure that the card is unmounted before r
+	-unning the below commands.
+
+-----------------------------------------------------------------------------------------------
+2.2.4.2 Flashing U-Boot Configuration and Kernel Boot Image
+We need to configure the U-Boot to load the kernel boot image and provide the correct DTB for o
+-ur compiled rich OS. 
+
+~Process
+* Mount the vfat partition (/dev/sdX1) of the SD card. Copy boot.cmd from pine64-LTS or the pin
+  -ephone folder. 
+  e.g:
+  > sudo mount /dev/sdb1 /mnt
+* Now copy the DTB file from the kernel build (Can be found in ./arch/arm64/boot/dts/allwinner)
+  The dtb file is 
+  >LTS< sun50i-a64-pine64-lts.dtb 
+  >PHN< sun50i-a64-pinephone-1.2.dtb
+  Note: The DTB for pinephone is based on the HW. In our case, HW revision is 1.2b for device w
+  -ith SKU:PPHONE-BE2
+* Copy the Kernel boot image (filename: Image) from the kernel build and run the below command
+  (Can be found in ./arch/arm64/boot)
+* Run the below command
+  > mkimage -C none -A arm64 -T script -d boot.cmd boot.scr
+
+-----------------------------------------------------------------------------------------------
+2.2.4.3 Flashing Kernel Filesystem and Rich OS
+We need to create a file structure for our linux and load the compiled kernel modules. There ar
+-e multiple methods to do this, but we debootstrap the file system.
+
+~Process
+* Mount the ext4 partition (/dev/sdX2) of the SD card to /mnt.
+  e.g:
+  > sudo mount /dev/sdb2 /mnt
+* Debootstrap to create file system (<distro> could be either buster or focal) 
+  > sudo debootstrap --arch=arm64 --foreign <distro> /mnt
+  > sudo cp /usr/bin/qemu-aarch64-static /mnt/usr/bin/
+  > sudo chroot /mnt /usr/bin/qemu-aarch64-static /bin/sh -i 
+  Now inside the chrooted console,
+  * Complete debootstrapping
+    # /debootstrap/debootstrap --second-stage
+  * Add root password
+    # passwd
+  * Setup Serial console
+    # systemctl enable serial-getty@ttyS0.service
+  * Create a new user, add password and give sudo permissions (replace username with your user)
+    # adduser username
+    # usermod -aG sudo username
+  * Exit chroot
+* Edit /etc/hostname of the created file system on /dev/sdX2 to change hostname of device.
+* Edit /etc/fstab to configure file system for kernel to read. Paste the below contents enclose
+  -d within ''' ''' to the fstab file
+'''
+# Adding tmpfs
+none		    /tmp	tmpfs	defaults,noatime,mode=1777	0	0
+# Adding rootfs
+/dev/mmcblk0p2	/	    ext4	defaults	                0	1 
+# Adding boot partition
+/dev/mmcblk0p1	/boot	vfat	defaults	                0	2
+'''
+* Copy the installed modules from linux build to the lib directory of mounted file system on sd
+  card
+
+*** 'qemu-aarch64-static has to be available in the host system that is used to build and creat
+	-e the file system. Install qemu-user-static package using 'yum' or 'apt-get' or 'dnf' base
+	-d on host system kernel
+*** Changing files on the debootstrapped file system should be done with text editors in admin
+	mode or change the permissions of the file to allow user edits before editing the same.
+
+-----------------------------------------------------------------------------------------------
+2.2.4.5 
+
+-----------------------------------------------------------------------------------------------
+2.2.4.6 Flashing OPTEE, ARM-TF and UBOOT
+Flash the u-boot-sunxi-with-spl.bin from Section 2.2.4.1. Change directory to 'u-boot' director
+-y and run the below command
+> sudo dd if=u-boot-sunxi-with-spl.bin of=/dev/sdX bs=1k seek=8
+
+*** get the block name of the sd card using command lsblk. 'X' above has to be replaced by the 
+	respective letter assigned to the sd card. Also ensure that the card is unmounted before r
+	-unning the below commands.
+
+-----------------------------------------------------------------------------------------------
+2.2.4.6 
+
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+SECTION 4 - Additional Information
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+4.1. Weblinks
+*** TA Memory and TEE Threads (OP-TEE): Explanation of TA Stacks, TEE Memory, Heap allocatio
+    -n and thread handling.
+    https://github.com/OP-TEE/optee_os/issues/1724
+
+***
+
+sudo ln -s -f /usr/bin/python3 /usr/bin/python
+
+make CFG_ARM64_CORE=y   CFG_TEE_LOGLEVEL=4   CFG_TEE_CORE_LOG_LEVEL=4   CFG_CORE_DEBUG_CHECK_STACKS=1   CROSS_COMPILE32="ccache arm-linux-gnueabihf-"   CROSS_COMPILE64="ccache aarch64-linux-gnu-"   DEBUG=4   PLATFORM=sunxi-sun50i_a64
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
