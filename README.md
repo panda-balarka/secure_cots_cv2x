@@ -3,6 +3,8 @@ Provides code, repos, documents, logs for the work on secure cv2x with COTS UE
 
 The various software modules, code and other opensourced repositories are the modified versions of the respective repositories. Please clone the base version of the same and use comparison tools like BeyondCompare to get details on the changes done for each of the repository. The base version detauls of git repos or other softwares used are listed in the original-version-info.txt
 
+1. To get OPTEE running on Pine64 LTS and Pinephone v1.2b refer to PINE_OPTEE_DOCUMENTATION.txt
+
 ## Changes:
 
 ### ARM-TF (use v2.5 from https://github.com/ARM-software/arm-trusted-firmware)
